@@ -1,0 +1,193 @@
+{
+  "info": {
+    "name": "DeadSat Resurrection API",
+    "description": "Complete Postman collection for DeadSat Resurrection — AI-2 FastAPI server.\nBase URL: http://localhost:8000\n\nDemo flow:\n1. GET /health — confirm nominal\n2. POST /fault/inject — inject fault\n3. GET /telemetry — see fault in telemetry\n4. POST /recovery/trigger — run LangGraph agent\n5. GET /health — confirm recovery",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": ["{{base_url}}"],
+          "path": ["health"]
+        },
+        "description": "Quick health summary for all 4 subsystems.\nExpect: all statuses = nominal"
+      }
+    },
+    {
+      "name": "2. Get Live Telemetry",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/telemetry",
+          "host": ["{{base_url}}"],
+          "path": ["telemetry"]
+        },
+        "description": "Full telemetry frame — OBC, ADCS, Power, Comms.\nFE-2 polls this every 1 second."
+      }
+    },
+    {
+      "name": "3. Get Telemetry History (60 frames)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/telemetry/history?n=60",
+          "host": ["{{base_url}}"],
+          "path": ["telemetry", "history"],
+          "query": [{ "key": "n", "value": "60" }]
+        },
+        "description": "Sliding window of last N frames.\nAI-1 classifier uses this for anomaly detection."
+      }
+    },
+    {
+      "name": "4. Get Ground Contact Window",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/contact",
+          "host": ["{{base_url}}"],
+          "path": ["contact"]
+        },
+        "description": "Next ground contact window over Ahmedabad.\nPowered by N2YO live API if key is set, else sgp4 fallback."
+      }
+    },
+    {
+      "name": "5a. Inject Fault — SEU",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fault_type\": \"SEU\",\n  \"register\": \"0x3F\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/fault/inject",
+          "host": ["{{base_url}}"],
+          "path": ["fault", "inject"]
+        },
+        "description": "Inject Single Event Upset — cosmic ray bit flip.\nADCS rate will spike, pointing error grows."
+      }
+    },
+    {
+      "name": "5b. Inject Fault — Software Bug",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fault_type\": \"software_bug\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/fault/inject",
+          "host": ["{{base_url}}"],
+          "path": ["fault", "inject"]
+        },
+        "description": "OBC crash loop — CPU runaway, memory corruption, downlink drops."
+      }
+    },
+    {
+      "name": "5c. Inject Fault — Firmware Corruption",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fault_type\": \"firmware_corruption\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/fault/inject",
+          "host": ["{{base_url}}"],
+          "path": ["fault", "inject"]
+        },
+        "description": "Firmware image corrupted — all subsystems degrading, comms down."
+      }
+    },
+    {
+      "name": "5d. Inject Fault — Command Injection",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fault_type\": \"command_injection\",\n  \"payload\": \"ROGUE_CMD_0xDEAD\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/fault/inject",
+          "host": ["{{base_url}}"],
+          "path": ["fault", "inject"]
+        },
+        "description": "Unsigned rogue command injected — comms compromised, power draining."
+      }
+    },
+    {
+      "name": "6. Trigger Recovery (LangGraph Agent)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fault_type\": \"SEU\",\n  \"fault_detail\": {\n    \"register\": \"0x3F\",\n    \"bit_flipped\": 3,\n    \"subsystem\": \"ADCS\"\n  },\n  \"telemetry_frame\": {}\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/recovery/trigger",
+          "host": ["{{base_url}}"],
+          "path": ["recovery", "trigger"]
+        },
+        "description": "Kick off the LangGraph 9-step recovery agent.\nReturns immediately — agent runs in background.\nWatch terminal for live node-by-node logs.\nChange fault_type to match whatever was injected."
+      }
+    },
+    {
+      "name": "7. Check Recovery (Health)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": ["{{base_url}}"],
+          "path": ["health"]
+        },
+        "description": "Poll after recovery trigger.\nExpect: overall = nominal within 30-90 seconds."
+      }
+    },
+    {
+      "name": "8. Reset Satellite",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/reset",
+          "host": ["{{base_url}}"],
+          "path": ["reset"]
+        },
+        "description": "Full reset to nominal state.\nUse between demo runs."
+      }
+    },
+    {
+      "name": "9. API Docs (Swagger)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/docs",
+          "host": ["{{base_url}}"],
+          "path": ["docs"]
+        },
+        "description": "Interactive Swagger UI — test all endpoints from the browser."
+      }
+    }
+  ]
+}

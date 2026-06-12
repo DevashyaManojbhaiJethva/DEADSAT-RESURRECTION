@@ -1,0 +1,401 @@
+{
+  "version": "1.0",
+  "description": "DeadSat Resurrection \u2014 Recovery Procedure Library. Maps fault types to ordered command sequences. Each procedure is tried in priority order; fallback to next if satellite does not return to nominal.",
+  "procedures": {
+    "SEU": {
+      "fault_type": "SEU",
+      "description": "Single Event Upset \u2014 cosmic ray bit flip in OBC/ADCS register",
+      "detection_indicators": [
+        "adcs_rate_deg_s > 0.1",
+        "adcs_pointing_err_deg > 1.0",
+        "obc_error_count_delta > 0",
+        "adcs_status == fault"
+      ],
+      "recovery_priority": [
+        {
+          "priority": 1,
+          "procedure_name": "ADCS_MEMORY_SCRUB_v2",
+          "description": "Scrub ADCS memory, reset pointing registers, re-initialise attitude estimator",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "ADCS_SAFE_HOLD",
+              "args": {},
+              "description": "Enter ADCS safe hold mode"
+            },
+            {
+              "seq": 2,
+              "cmd": "OBC_SCRUB_REGISTER",
+              "args": {
+                "reg": "0x3F"
+              },
+              "description": "ECC scrub on faulted register"
+            },
+            {
+              "seq": 3,
+              "cmd": "ADCS_RESET_ESTIMATOR",
+              "args": {},
+              "description": "Reset Kalman filter / attitude estimator"
+            },
+            {
+              "seq": 4,
+              "cmd": "ADCS_RELOAD_PARAMS",
+              "args": {},
+              "description": "Reload nominal ADCS parameters from ROM"
+            },
+            {
+              "seq": 5,
+              "cmd": "ADCS_RESUME_CONTROL",
+              "args": {},
+              "description": "Resume normal attitude control"
+            }
+          ],
+          "success_criteria": {
+            "adcs_rate_deg_s": "< 0.01",
+            "adcs_pointing_err_deg": "< 0.01",
+            "adcs_status": "nominal"
+          },
+          "timeout_s": 30,
+          "min_confidence": 0.75
+        },
+        {
+          "priority": 2,
+          "procedure_name": "OBC_SOFT_REBOOT_v1",
+          "description": "Fallback \u2014 soft reboot OBC to clear all register corruption",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "WATCHDOG_DISABLE",
+              "args": {},
+              "description": "Disable watchdog before reboot"
+            },
+            {
+              "seq": 2,
+              "cmd": "OBC_SOFT_REBOOT",
+              "args": {
+                "delay_s": 5
+              },
+              "description": "Initiate OBC soft reboot"
+            },
+            {
+              "seq": 3,
+              "cmd": "WAIT",
+              "args": {
+                "duration_s": 15
+              },
+              "description": "Wait for OBC to come back online"
+            },
+            {
+              "seq": 4,
+              "cmd": "WATCHDOG_ENABLE",
+              "args": {},
+              "description": "Re-enable watchdog"
+            }
+          ],
+          "success_criteria": {
+            "obc_status": "nominal",
+            "adcs_status": "nominal"
+          },
+          "timeout_s": 60,
+          "min_confidence": 0.7
+        }
+      ]
+    },
+    "software_bug": {
+      "fault_type": "software_bug",
+      "description": "OBC software crash loop \u2014 memory pointer corruption, CPU runaway",
+      "detection_indicators": [
+        "obc_cpu_pct > 85",
+        "obc_memory_pct > 80",
+        "obc_error_count_delta > 3",
+        "comms_downlink == false",
+        "obc_status == fault"
+      ],
+      "recovery_priority": [
+        {
+          "priority": 1,
+          "procedure_name": "OBC_SOFT_REBOOT_v1",
+          "description": "Software process restart \u2014 fastest recovery path",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "KILL_PROCESS",
+              "args": {
+                "pid": "all_user"
+              },
+              "description": "Kill all user processes on OBC"
+            },
+            {
+              "seq": 2,
+              "cmd": "CLEAR_MEMORY_HEAP",
+              "args": {},
+              "description": "Clear heap memory region"
+            },
+            {
+              "seq": 3,
+              "cmd": "OBC_SOFT_REBOOT",
+              "args": {
+                "delay_s": 3
+              },
+              "description": "Soft reboot OBC"
+            },
+            {
+              "seq": 4,
+              "cmd": "WAIT",
+              "args": {
+                "duration_s": 20
+              },
+              "description": "Wait for boot"
+            },
+            {
+              "seq": 5,
+              "cmd": "COMMS_DOWNLINK_ENABLE",
+              "args": {},
+              "description": "Re-enable downlink after reboot"
+            }
+          ],
+          "success_criteria": {
+            "obc_cpu_pct": "< 50",
+            "obc_memory_pct": "< 60",
+            "obc_status": "nominal",
+            "comms_downlink": "true"
+          },
+          "timeout_s": 45,
+          "min_confidence": 0.7
+        },
+        {
+          "priority": 2,
+          "procedure_name": "OBC_HARD_RESET_v1",
+          "description": "Fallback \u2014 power cycle OBC board entirely",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "OBC_POWER_OFF",
+              "args": {
+                "delay_s": 2
+              },
+              "description": "Cut power to OBC"
+            },
+            {
+              "seq": 2,
+              "cmd": "WAIT",
+              "args": {
+                "duration_s": 5
+              },
+              "description": "Hold in reset"
+            },
+            {
+              "seq": 3,
+              "cmd": "OBC_POWER_ON",
+              "args": {},
+              "description": "Power OBC back on"
+            },
+            {
+              "seq": 4,
+              "cmd": "WAIT",
+              "args": {
+                "duration_s": 25
+              },
+              "description": "Wait for full boot"
+            }
+          ],
+          "success_criteria": {
+            "obc_status": "nominal"
+          },
+          "timeout_s": 90,
+          "min_confidence": 0.8
+        }
+      ]
+    },
+    "firmware_corruption": {
+      "fault_type": "firmware_corruption",
+      "description": "Firmware image corrupted \u2014 checksum mismatch, all subsystems degrading",
+      "detection_indicators": [
+        "obc_status == fault",
+        "comms_uplink == false",
+        "comms_downlink == false",
+        "power_status == degraded"
+      ],
+      "recovery_priority": [
+        {
+          "priority": 1,
+          "procedure_name": "FIRMWARE_ROLLBACK_v1",
+          "description": "Rollback to last known good firmware image from ROM backup",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "ENTER_SAFE_MODE",
+              "args": {},
+              "description": "Enter minimal safe mode"
+            },
+            {
+              "seq": 2,
+              "cmd": "VERIFY_ROM_BACKUP",
+              "args": {},
+              "description": "Verify backup firmware checksum in ROM"
+            },
+            {
+              "seq": 3,
+              "cmd": "FIRMWARE_ROLLBACK",
+              "args": {
+                "target": "ROM_BACKUP_v3"
+              },
+              "description": "Flash backup firmware image"
+            },
+            {
+              "seq": 4,
+              "cmd": "WAIT",
+              "args": {
+                "duration_s": 30
+              },
+              "description": "Wait for firmware flash to complete"
+            },
+            {
+              "seq": 5,
+              "cmd": "FULL_SYSTEM_RESTART",
+              "args": {},
+              "description": "Restart all subsystems with new firmware"
+            },
+            {
+              "seq": 6,
+              "cmd": "COMMS_FULL_ENABLE",
+              "args": {},
+              "description": "Re-enable uplink + downlink"
+            }
+          ],
+          "success_criteria": {
+            "obc_status": "nominal",
+            "comms_uplink": "true",
+            "comms_downlink": "true",
+            "adcs_status": "nominal"
+          },
+          "timeout_s": 90,
+          "min_confidence": 0.9
+        },
+        {
+          "priority": 2,
+          "procedure_name": "SAFE_MODE_HOLD",
+          "description": "Emergency fallback \u2014 hold in minimal safe mode, await next ground contact",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "ENTER_SAFE_MODE",
+              "args": {},
+              "description": "Maintain safe mode"
+            },
+            {
+              "seq": 2,
+              "cmd": "BEACON_ENABLE",
+              "args": {
+                "interval_s": 30
+              },
+              "description": "Enable survival beacon"
+            }
+          ],
+          "success_criteria": {
+            "beacon_active": "true"
+          },
+          "timeout_s": 60,
+          "min_confidence": 0.6
+        }
+      ]
+    },
+    "command_injection": {
+      "fault_type": "command_injection",
+      "description": "Unsigned rogue command injected to comms channel \u2014 attacker draining power, compromising systems",
+      "detection_indicators": [
+        "comms_status == fault",
+        "fault_detail.signed == false",
+        "power_w_delta < -2"
+      ],
+      "recovery_priority": [
+        {
+          "priority": 1,
+          "procedure_name": "LOCKDOWN_REGEN_v1",
+          "description": "Lockdown comms, flush command queue, regenerate session keys, restore power",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "COMMS_LOCKDOWN",
+              "args": {},
+              "description": "Immediately close all uplink channels"
+            },
+            {
+              "seq": 2,
+              "cmd": "FLUSH_CMD_QUEUE",
+              "args": {},
+              "description": "Flush all pending commands from queue"
+            },
+            {
+              "seq": 3,
+              "cmd": "REGEN_SESSION_KEY",
+              "args": {},
+              "description": "Regenerate Dilithium session key pair"
+            },
+            {
+              "seq": 4,
+              "cmd": "POWER_RESTORE",
+              "args": {
+                "target_w": 82.4
+              },
+              "description": "Restore nominal solar power configuration"
+            },
+            {
+              "seq": 5,
+              "cmd": "COMMS_RESUME_SECURE",
+              "args": {},
+              "description": "Re-enable comms with new session key"
+            }
+          ],
+          "success_criteria": {
+            "comms_status": "nominal",
+            "power_status": "nominal",
+            "power_w": "> 75"
+          },
+          "timeout_s": 30,
+          "min_confidence": 0.8
+        },
+        {
+          "priority": 2,
+          "procedure_name": "COMMS_HARD_RESET_v1",
+          "description": "Fallback \u2014 power cycle comms subsystem entirely",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "COMMS_POWER_OFF",
+              "args": {},
+              "description": "Cut power to comms subsystem"
+            },
+            {
+              "seq": 2,
+              "cmd": "WAIT",
+              "args": {
+                "duration_s": 10
+              },
+              "description": "Hold reset"
+            },
+            {
+              "seq": 3,
+              "cmd": "COMMS_POWER_ON",
+              "args": {},
+              "description": "Restore comms power"
+            },
+            {
+              "seq": 4,
+              "cmd": "WAIT",
+              "args": {
+                "duration_s": 10
+              },
+              "description": "Wait for comms boot"
+            }
+          ],
+          "success_criteria": {
+            "comms_status": "nominal"
+          },
+          "timeout_s": 60,
+          "min_confidence": 0.75
+        }
+      ]
+    }
+  }
+}

@@ -1,203 +1,247 @@
-# 🛰️ DeadSat Resurrection
-
-> **FAR AWAY 2026 Hackathon** — Space & Aerospace + Agentic Systems + Cybersecurity tracks
-
-An autonomous cyber-forensic satellite recovery system. ISRO takes **48–96 hours** to manually recover a bricked satellite. DeadSat Resurrection does it in **under 90 seconds**.
-
----
-
-## The Problem
-
-Satellites fail. SEU bit flips, firmware corruption, software crashes, rogue command injections — any of these can brick a satellite mid-orbit. Current recovery is entirely manual: engineers analyse telemetry, write recovery commands, wait for a ground contact window, uplink, and hope. It takes days.
-
-## The Solution
-
-A fully autonomous 4-stage pipeline:
-
-```
-Anomaly Detection → Fault Classification → Recovery Generation → Signed Uplink
-     (AI-1)              (AI-1)                 (AI-2)              (CY-1 + AI-2)
-```
-
-1. **Isolation Forest + Transformer** monitors live telemetry for anomalies
-2. **Transformer Encoder** classifies the fault type (SEU / software bug / firmware corruption / command injection)
-3. **LangGraph agentic pipeline** selects the correct recovery procedure, generates a command sequence, and automatically falls back to the next procedure if the first fails
-4. **CRYSTALS-Dilithium** (NIST 2024 PQC standard) signs every command before uplink — verified by the satellite before execution, logged in a tamper-evident hash-chain ledger
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  Raspberry Pi 4 #1                  │
-│                                                     │
-│  ┌──────────┐    ┌──────────┐    ┌───────────────┐  │
-│  │ Satellite│───▶│ FastAPI  │───▶|  LangGraph   │  │
-│  │ Emulator │    │  :8000   │    │  Recovery     │  │
-│  │ (AI-2)   │◀───│          │◀───│  Agent (AI-2)│  │
-│  └──────────┘    └──────────┘    └───────────────┘  │
-│       │               │                  │          │
-│       │          ┌────▼────┐    ┌────────▼──────┐   │
-│       │          │Anomaly  │    │  Dilithium    │   │
-│       │          │Detector │    │  Signing      │   │
-│       │          │+ Class. │    │  Service CY-1 │   │
-│       │          │ (AI-1)  │    │   :8001       │   │
-│       │          └─────────┘    └───────────────┘   │
-│       │                                             │
-│  ┌────▼──────────────────────────────────────────┐  │
-│  │         React Dashboard (FE-1)  :3000         │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────┐
-│                  Raspberry Pi 4 #2                  │
-│         RTL-SDR — live RF on 137 MHz NOAA band      │
-└─────────────────────────────────────────────────────┘
-```
-
----
-
 ## Repository Structure
 
-```
+```text
 DEADSAT-RESURRECTION/
-├── satellite_emulator.py     # AI-2 — Satellite state machine (OBC/ADCS/Power/Comms)
-├── contact_calculator.py     # AI-2 — TLE-based ground contact over Ahmedabad (sgp4)
-├── recovery_agent.py         # AI-2 — LangGraph 9-node recovery pipeline
-├── procedure_library.json    # AI-2 — All 4 fault → recovery procedure mappings
-├── main.py                   # AI-2 — FastAPI server (all integration endpoints)
+│
+├── agents/
+│   ├── recovery_agent.py
+│   └── procedure_library.json
+│
+├── emulator/
+│   ├── satellite_emulator.py
+│   └── contact_calculator.py
+│
+├── models/
+│   ├── satellite_fault_classifier.py
+│   ├── satellite_fault_classifier_V2.py
+│   └── satellite_fault_classifier_tle.py
+│
+├── data/
+│   ├── training_baselines.csv
+│   ├── input.csv
+│   ├── input_1.csv
+│   └── input_2.csv
+│
+├── docs/
+│   ├── deadsat_postman_collection.json
+│   ├── Satellite_Fault_Recovery_Design.docx
+│   └── CHANGES_V1_TO_V2.md
+│
+├── model_artifacts/
+│   ├── transformer_encoder.pt
+│   ├── isolation_forest.pkl
+│   ├── scaler.pkl
+│   └── meta.json
+│
+├── main.py
+├── real_data_fetcher.py
 ├── requirements.txt
+├── pyrightconfig.json
+├── .env.example
+├── .gitignore
 └── README.md
 ```
 
 ---
 
-## Quick Start
+# Satellite Fault Classifier — TLE / Orbital Element Edition
 
-```bash
-pip install -r requirements.txt
-python main.py                # FastAPI server starts on :8000
+## Why Version 2 Was Built
+
+The original classifier was designed for SatNOGS telemetry streams containing:
+
+- Temperature
+- Voltage
+- Current
+- RSSI
+- CPU load
+- ECC memory errors
+
+The real datasets used during development were CelesTrak/NORAD orbital element datasets:
+
+```text
+OBJECT_NAME
+OBJECT_ID
+EPOCH
+MEAN_MOTION
+ECCENTRICITY
+INCLINATION
+RA_OF_ASC_NODE
+ARG_OF_PERICENTER
+MEAN_ANOMALY
+EPHEMERIS_TYPE
+CLASSIFICATION_TYPE
+NORAD_CAT_ID
+ELEMENT_SET_NO
+REV_AT_EPOCH
+BSTAR
+MEAN_MOTION_DOT
+MEAN_MOTION_DDOT
 ```
 
-API docs available at `http://localhost:8000/docs`
+Because these datasets contain orbital parameters rather than onboard telemetry, the fault-classification pipeline was redesigned around orbital dynamics.
 
 ---
 
-## API Endpoints
+## Feature Engineering
 
-| Method | Path                      | Who calls it          | Description                               |
-| ------ | ------------------------- | --------------------- | ----------------------------------------- |
-| `GET`  | `/telemetry`              | FE-2 (polls every 1s) | Latest TM frame — all subsystems          |
-| `GET`  | `/telemetry/history?n=60` | AI-1                  | Sliding window for classifier             |
-| `GET`  | `/contact`                | FE-1                  | Next ground contact window over Ahmedabad |
-| `GET`  | `/health`                 | FE-1                  | Quick health summary for dashboard badges |
-| `POST` | `/fault/inject`           | FE-1 dashboard        | Inject fault for demo                     |
-| `POST` | `/recovery/trigger`       | AI-1                  | Kick off LangGraph recovery agent         |
-| `POST` | `/reset`                  | FE-1                  | Reset satellite to nominal between demos  |
+| Previous Telemetry Feature | New Orbital Feature |
+| -------------------------- | ------------------- |
+| temperature                | removed             |
+| voltage                    | removed             |
+| current                    | removed             |
+| rssi                       | removed             |
+| ecc_errors                 | ECCENTRICITY        |
+| uptime                     | REV_AT_EPOCH        |
+| reset_count                | REV_DELTA           |
+| —                          | TLE_AGE_HOURS       |
+| —                          | BSTAR               |
+| —                          | MEAN_MOTION_DOT     |
+| —                          | MEAN_MOTION_DDOT    |
+
+Derived features:
+
+- ECC_DELTA
+- REV_DELTA
+- TLE_AGE_HOURS
+- BSTAR anomaly score
+- MEAN_MOTION anomaly score
 
 ---
 
-## Fault Types
+## Fault Classification Logic
 
-| Fault                 | Subsystem Affected                   | Primary Recovery Procedure |
-| --------------------- | ------------------------------------ | -------------------------- |
-| `SEU`                 | ADCS (bit flip in attitude register) | `ADCS_MEMORY_SCRUB_v2`     |
-| `software_bug`        | OBC (crash loop, CPU runaway)        | `OBC_SOFT_REBOOT_v1`       |
-| `firmware_corruption` | All subsystems degrading             | `FIRMWARE_ROLLBACK_v1`     |
-| `command_injection`   | Comms (rogue unsigned command)       | `LOCKDOWN_REGEN_v1`        |
-
-Each fault has a primary procedure and a fallback — the LangGraph agent tries them in order automatically.
+| Fault Type          | Trigger                                             |
+| ------------------- | --------------------------------------------------- |
+| SEU                 | ECCENTRICITY jump between epochs (ECC_DELTA > 0.01) |
+| SOFTWARE_BUG        | REV_DELTA <= 0                                      |
+| FIRMWARE_CORRUPTION | BSTAR or MEAN_MOTION_DOT exceeds thresholds or >3σ  |
+| COMMAND_INJECTION   | TLE_AGE_HOURS > 72                                  |
+| NORMAL              | No anomaly detected                                 |
 
 ---
 
-## Telemetry Frame Schema
+## AI Architecture
 
-```json
-{
-  "timestamp": 1718000000,
-  "frame_id": 42,
-  "obc_register": "0x3F",
-  "obc_temp_c": 47.2,
-  "obc_error_count": 0,
-  "obc_cpu_pct": 18.5,
-  "obc_memory_pct": 34.2,
-  "obc_status": "nominal",
-  "adcs_rate_deg_s": 0.003,
-  "adcs_quaternion": [0.1, 0.2, 0.3, 0.9],
-  "adcs_wheel_rpm": 4800.0,
-  "adcs_pointing_err_deg": 0.001,
-  "adcs_status": "nominal",
-  "power_w": 82.4,
-  "battery_pct": 91.2,
-  "bus_voltage_v": 28.1,
-  "power_charging": true,
-  "power_status": "nominal",
-  "comms_uplink": true,
-  "comms_downlink": true,
-  "signal_strength_dbm": -78.3,
-  "comms_status": "nominal",
-  "fault_injected": null,
-  "fault_detail": {}
-}
+### Stage 1 — Isolation Forest
+
+Used as an anomaly gate.
+
+```text
+Input Window
+      │
+      ▼
+Isolation Forest
+      │
+      ├── Normal
+      └── Suspicious
+```
+
+### Stage 2 — Transformer Encoder
+
+```text
+8-step orbital sequence
+          │
+          ▼
+Transformer Encoder
+          │
+          ▼
+Fault Class
+```
+
+Classes:
+
+- NORMAL
+- SEU
+- SOFTWARE_BUG
+- FIRMWARE_CORRUPTION
+- COMMAND_INJECTION
+
+---
+
+## Model Artifacts
+
+```text
+model_artifacts/
+├── transformer_encoder.pt
+├── isolation_forest.pkl
+├── scaler.pkl
+└── meta.json
 ```
 
 ---
 
-## LangGraph Recovery Pipeline
+## Live Data Sources
 
-```
-START
-  │
-  ▼
-load_procedures ──▶ select_procedure ──▶ generate_commands ──▶ request_signing
-                          ▲                                           │
-                          │                                    ┌──────▼──────┐
-                          │                                    │ CY-1 signs  │
-                          │                                    │ (or mock)   │
-                          │                                    └──────┬──────┘
-                          │                                           │
-                       fallback ◀── monitor_recovery ◀── uplink_commands ◀── schedule_uplink
-                          │               │
-                          │        ┌──────▼──────┐
-                          │        │   SUCCESS   │──▶ report_success ──▶ END
-                          │        └─────────────┘
-                          │
-                    (next priority)
-                          │
-                    (exhausted) ──▶ report_failure ──▶ END
+### Offline Mode
+
+Uses:
+
+```text
+input.csv
+input_1.csv
+input_2.csv
 ```
 
----
+### Live Mode
 
-## 90-Second Demo Flow
+Uses N2YO TLE API:
 
-1. Dashboard loads → `/telemetry` polling starts — all green
-2. Judge clicks **Inject SEU** → `POST /fault/inject {"fault_type": "SEU"}`
-3. ADCS rate spikes on dashboard — Isolation Forest flags anomaly
-4. Transformer classifies → `SEU` confirmed
-5. AI-1 calls `POST /recovery/trigger`
-6. LangGraph agent: load → select `ADCS_MEMORY_SCRUB_v2` → generate 5 commands → Dilithium sign → check contact window → uplink
-7. Emulator applies recovery → ADCS nominal
-8. Dashboard goes green ✓
-9. **Total elapsed: < 90 seconds**
+```text
+https://api.n2yo.com/rest/v1/satellite/tle/{NORAD_ID}
+```
 
----
+Tracked satellites:
 
-## Team
-
-| Role     | Responsibilities                                                                 |
-| -------- | -------------------------------------------------------------------------------- |
-| AI-1     | Anomaly detection (Isolation Forest), fault classification (Transformer Encoder) |
-| **AI-2** | **Satellite emulator, LangGraph recovery agent, FastAPI server**                 |
-| FE-1     | React dashboard, real-time telemetry visualisation                               |
-| FE-2     | Frontend integration, API wiring                                                 |
-| CY-1     | CRYSTALS-Dilithium signing service, hash-chain ledger                            |
+- ISS (25544)
+- AMSAT OSCAR-7 (7530)
+- CUTE-1 / CO-55 (27844)
+- AO-10 (14129)
+- NOAA-19 (33591)
 
 ---
 
-## Hardware
+## Performance
 
-- **Pi 4 #1** — FastAPI + emulator + classifier + LangGraph agent + signing service (4GB RAM)
-- **Pi 4 #2** — RTL-SDR receiver, live satellite signals on 137 MHz NOAA band
-- **Demo screens** — React dashboard on projector | terminal logs on Pi #1 | RF spectrum on Pi #2
+Training dataset:
+
+```text
+849 original orbital records
+≈1860 augmented sequences
+```
+
+Observed validation performance:
+
+```text
+Accuracy: 99–100%
+```
+
+Note:
+
+This accuracy reflects rule-based bootstrapped labels used during development. Production deployment should use mission-verified fault logs and real anomaly events.
+
+---
+
+## Inference Output
+
+Example:
+
+```python
+anomaly, fault_class, confidence = predict(...)
+```
+
+Output:
+
+```text
+True
+SEU
+0.98
+```
+
+Meaning:
+
+```text
+Anomaly Detected: YES
+Fault Type: SEU
+Confidence: 98%
+```

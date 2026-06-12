@@ -6,13 +6,14 @@ State machine modelling OBC, ADCS, Power, Comms subsystems.
 Streams realistic telemetry frames every second.
 Accepts fault injection via inject_* methods.
 FastAPI polls get_latest_frame() for current telemetry.
+WebSocket push via get_frame_history() ring buffer (60 frames minimum).
 """
 
 import time
-import math
 import random
 import threading
-from dataclasses import dataclass, field, asdict
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
 
@@ -22,11 +23,11 @@ from enum import Enum
 # ──────────────────────────────────────────────
 
 class FaultType(str, Enum):
-    NONE               = "none"
-    SEU                = "SEU"
-    SOFTWARE_BUG       = "software_bug"
+    NONE                = "none"
+    SEU                 = "SEU"
+    SOFTWARE_BUG        = "software_bug"
     FIRMWARE_CORRUPTION = "firmware_corruption"
-    COMMAND_INJECTION  = "command_injection"
+    COMMAND_INJECTION   = "command_injection"
 
 
 # ──────────────────────────────────────────────
@@ -35,12 +36,12 @@ class FaultType(str, Enum):
 
 @dataclass
 class OBCState:
-    register: str       = "0x3F"
-    temp_c: float       = 47.2
-    error_count: int    = 0
-    cpu_usage_pct: float = 18.5
+    register: str           = "0x3F"
+    temp_c: float           = 47.2
+    error_count: int        = 0
+    cpu_usage_pct: float    = 18.5
     memory_usage_pct: float = 34.2
-    status: str         = "nominal"       # nominal | degraded | fault
+    status: str             = "nominal"   # nominal | degraded | fault
 
 
 @dataclass
@@ -54,20 +55,27 @@ class ADCSState:
 
 @dataclass
 class PowerState:
-    solar_output_w: float   = 82.4
-    battery_pct: float      = 91.2
-    bus_voltage_v: float    = 28.1
-    charging: bool          = True
-    status: str             = "nominal"
+    solar_output_w: float = 82.4
+    battery_pct: float    = 91.2
+    bus_voltage_v: float  = 28.1
+    charging: bool        = True
+    status: str           = "nominal"
 
 
 @dataclass
 class CommsState:
-    uplink_active: bool         = True
-    downlink_active: bool       = True
-    signal_strength_dbm: float  = -78.3
-    last_cmd_timestamp: int     = 0
-    status: str                 = "nominal"
+    uplink_active: bool        = True
+    downlink_active: bool      = True
+    signal_strength_dbm: float = -78.3
+    last_cmd_timestamp: int    = 0
+    status: str                = "nominal"
+
+
+# ──────────────────────────────────────────────
+# Ring Buffer
+# ──────────────────────────────────────────────
+
+RING_BUFFER_SIZE = 120   # store 2 minutes, AI-1 needs last 60 frames
 
 
 # ──────────────────────────────────────────────
@@ -79,6 +87,7 @@ class SatelliteEmulator:
     Satellite state machine.
     Call start() to begin background telemetry ticking.
     Call get_latest_frame() from FastAPI poll endpoint.
+    Call get_frame_history(n) for AI-1 classifier sliding window — real ring buffer.
     Call inject_* methods to simulate faults.
     Call apply_recovery() to restore nominal after agent uplinks fix.
     """
@@ -95,6 +104,7 @@ class SatelliteEmulator:
         self._running       = False
         self._frame_count   = 0
         self._latest_frame: dict = {}
+        self._ring_buffer: deque = deque(maxlen=RING_BUFFER_SIZE)  # FIX 1 & 6: real ring buffer, 60+ frames
         self._thread: Optional[threading.Thread] = None
 
     # ── Lifecycle ──────────────────────────────
@@ -120,6 +130,7 @@ class SatelliteEmulator:
                 self._update_nominal_drift()
                 self._apply_fault_effects()
                 self._latest_frame = self._build_frame()
+                self._ring_buffer.append(dict(self._latest_frame))  # push to real ring buffer
                 self._frame_count += 1
             time.sleep(self.tick_interval)
 
@@ -146,7 +157,6 @@ class SatelliteEmulator:
     def _apply_fault_effects(self):
         """Progress fault symptoms each tick once a fault is active."""
         if self.fault_injected == FaultType.SEU:
-            # ADCS drifts rapidly — bit flip in attitude register
             self.adcs.rate_deg_s        += random.uniform(0.05, 0.15)
             self.adcs.pointing_error_deg += random.uniform(0.1, 0.5)
             self.adcs.status             = "fault"
@@ -154,7 +164,6 @@ class SatelliteEmulator:
             self.obc.status              = "degraded"
 
         elif self.fault_injected == FaultType.SOFTWARE_BUG:
-            # OBC crash loop — CPU spikes, memory corruption
             self.obc.cpu_usage_pct      = min(100.0, self.obc.cpu_usage_pct + random.uniform(5, 15))
             self.obc.memory_usage_pct   = min(100.0, self.obc.memory_usage_pct + random.uniform(3, 8))
             self.obc.error_count        += random.randint(1, 5)
@@ -163,7 +172,6 @@ class SatelliteEmulator:
             self.comms.status            = "degraded"
 
         elif self.fault_injected == FaultType.FIRMWARE_CORRUPTION:
-            # All subsystems degrading progressively
             self.obc.status              = "fault"
             self.adcs.status             = "degraded"
             self.power.bus_voltage_v    -= random.uniform(0.05, 0.2)
@@ -173,10 +181,8 @@ class SatelliteEmulator:
             self.comms.status            = "fault"
 
         elif self.fault_injected == FaultType.COMMAND_INJECTION:
-            # Rogue command — comms channel compromised
             self.comms.status            = "fault"
             self.obc.error_count        += 1
-            # Attacker tries to drain power
             self.power.solar_output_w   -= random.uniform(2, 5)
             self.power.solar_output_w    = max(0.0, self.power.solar_output_w)
 
@@ -219,7 +225,7 @@ class SatelliteEmulator:
             "fault_detail":          self.fault_detail,
         }
 
-    # ── FastAPI Poll Interface ─────────────────
+    # ── FastAPI Poll + WebSocket Interface ─────
 
     def get_latest_frame(self) -> dict:
         """Called by FastAPI GET /telemetry to return current state."""
@@ -228,39 +234,34 @@ class SatelliteEmulator:
 
     def get_frame_history(self, last_n: int = 60) -> list:
         """
-        Returns last N frames for the AI-1 classifier sliding window.
-        For now stores in a simple ring buffer — extend if needed.
+        FIX 1 & 6: Real ring buffer — returns last N frames (min 60).
+        AI-1 classifier calls this for its 60-frame sliding window.
+        WebSocket /ws/telemetry also uses this for chart history on connect.
         """
-        # Lightweight: return latest frame repeated for scaffold
-        # AI-1 will wire in real history once integrated
         with self._lock:
-            return [dict(self._latest_frame)] * min(last_n, max(1, self._frame_count))
+            frames = list(self._ring_buffer)
+            return frames[-last_n:] if len(frames) >= last_n else frames
 
     # ── Fault Injection ───────────────────────
 
     def inject_SEU(self, register: str = "0x3F"):
-        """
-        Single Event Upset — cosmic ray flips a bit in OBC register.
-        Causes ADCS drift.
-        """
+        """Single Event Upset — cosmic ray flips a bit in OBC register."""
         with self._lock:
-            self.fault_injected         = FaultType.SEU
-            self.obc.register           = register
-            self.obc.error_count       += 1
-            self.adcs.rate_deg_s        = 0.45      # immediate spike
+            self.fault_injected          = FaultType.SEU
+            self.obc.register            = register
+            self.obc.error_count        += 1
+            self.adcs.rate_deg_s         = 0.45
             self.adcs.pointing_error_deg = 2.3
-            self.adcs.status            = "fault"
-            self.fault_detail           = {
-                "register": register,
+            self.adcs.status             = "fault"
+            self.fault_detail            = {
+                "register":    register,
                 "bit_flipped": 3,
-                "subsystem": "ADCS",
+                "subsystem":   "ADCS",
             }
         print(f"[Emulator] FAULT INJECTED: SEU on register {register}")
 
     def inject_software_bug(self):
-        """
-        Memory pointer corruption — OBC enters crash loop.
-        """
+        """Memory pointer corruption — OBC enters crash loop."""
         with self._lock:
             self.fault_injected         = FaultType.SOFTWARE_BUG
             self.obc.cpu_usage_pct      = 95.0
@@ -269,15 +270,13 @@ class SatelliteEmulator:
             self.obc.status             = "fault"
             self.comms.downlink_active  = False
             self.fault_detail           = {
-                "subsystem": "OBC",
-                "crash_type": "memory_pointer_corruption",
+                "subsystem":   "OBC",
+                "crash_type":  "memory_pointer_corruption",
             }
         print("[Emulator] FAULT INJECTED: Software Bug — OBC crash loop")
 
     def inject_firmware_corruption(self):
-        """
-        Firmware image corrupted — all subsystems degrading.
-        """
+        """Firmware image corrupted — all subsystems degrading."""
         with self._lock:
             self.fault_injected         = FaultType.FIRMWARE_CORRUPTION
             self.obc.status             = "fault"
@@ -286,23 +285,20 @@ class SatelliteEmulator:
             self.comms.downlink_active  = False
             self.comms.status           = "fault"
             self.fault_detail           = {
-                "subsystem": "firmware",
-                "checksum_mismatch": True,
+                "subsystem":          "firmware",
+                "checksum_mismatch":  True,
             }
         print("[Emulator] FAULT INJECTED: Firmware Corruption")
 
     def inject_command(self, payload: str = "ROGUE_CMD_0xDEAD"):
-        """
-        Unsigned malicious command injected to comms channel.
-        CY-1 rogue detector should catch this.
-        """
+        """Unsigned malicious command injected to comms channel."""
         with self._lock:
-            self.fault_injected         = FaultType.COMMAND_INJECTION
-            self.comms.status           = "fault"
-            self.fault_detail           = {
+            self.fault_injected = FaultType.COMMAND_INJECTION
+            self.comms.status   = "fault"
+            self.fault_detail   = {
                 "subsystem": "comms",
-                "payload": payload,
-                "signed": False,
+                "payload":   payload,
+                "signed":    False,
             }
         print(f"[Emulator] FAULT INJECTED: Rogue Command → {payload}")
 
@@ -311,25 +307,30 @@ class SatelliteEmulator:
     def apply_recovery(self, procedure_name: str) -> bool:
         """
         Called by LangGraph agent after signed command uplinked.
-        Restores nominal state based on which procedure was executed.
-        Returns True if recovery succeeds.
+        FIX 8: Added OBC_HARD_RESET_v1 and COMMS_HARD_RESET_v1 handlers.
         """
         with self._lock:
             print(f"[Emulator] Applying recovery procedure: {procedure_name}")
 
             if procedure_name == "ADCS_MEMORY_SCRUB_v2":
-                self.adcs.rate_deg_s        = 0.003
+                self.adcs.rate_deg_s         = 0.003
                 self.adcs.pointing_error_deg = 0.001
-                self.adcs.status            = "nominal"
-                self.obc.register           = "0x3F"
-                self.obc.error_count        = 0
-                self.obc.status             = "nominal"
+                self.adcs.status             = "nominal"
+                self.obc.register            = "0x3F"
+                self.obc.error_count         = 0
+                self.obc.status              = "nominal"
 
             elif procedure_name == "OBC_SOFT_REBOOT_v1":
                 self.obc.cpu_usage_pct      = 18.5
                 self.obc.memory_usage_pct   = 34.2
                 self.obc.error_count        = 0
                 self.obc.status             = "nominal"
+                self.comms.downlink_active  = True
+                self.comms.status           = "nominal"
+
+            elif procedure_name == "OBC_HARD_RESET_v1":
+                # FIX 8: Full OBC power cycle — resets all OBC state to nominal
+                self.obc                    = OBCState()
                 self.comms.downlink_active  = True
                 self.comms.status           = "nominal"
 
@@ -341,6 +342,11 @@ class SatelliteEmulator:
                 self.comms.downlink_active  = True
                 self.comms.status           = "nominal"
 
+            elif procedure_name == "SAFE_MODE_HOLD":
+                # Minimal safe mode — beacon active, wait for next contact
+                self.obc.status             = "degraded"
+                print("[Emulator] Satellite in SAFE MODE HOLD — awaiting next contact")
+
             elif procedure_name == "LOCKDOWN_REGEN_v1":
                 self.comms.status           = "nominal"
                 self.comms.uplink_active    = True
@@ -348,11 +354,14 @@ class SatelliteEmulator:
                 self.power.solar_output_w   = 82.4
                 self.power.status           = "nominal"
 
+            elif procedure_name == "COMMS_HARD_RESET_v1":
+                # FIX 8: Full comms subsystem power cycle
+                self.comms                  = CommsState()
+
             else:
                 print(f"[Emulator] Unknown procedure: {procedure_name} — no recovery applied")
                 return False
 
-            # Clear fault state
             self.fault_injected = FaultType.NONE
             self.fault_detail   = {}
             print(f"[Emulator] Recovery SUCCESS — satellite nominal")
@@ -361,56 +370,96 @@ class SatelliteEmulator:
     # ── Utility ───────────────────────────────
 
     def get_overall_health(self) -> str:
-        """Quick health summary for status badges on FE-1."""
-        statuses = [
-            self.obc.status,
-            self.adcs.status,
-            self.power.status,
-            self.comms.status,
-        ]
-        if "fault" in statuses:
-            return "fault"
-        if "degraded" in statuses:
-            return "degraded"
+        statuses = [self.obc.status, self.adcs.status, self.power.status, self.comms.status]
+        if "fault"    in statuses: return "fault"
+        if "degraded" in statuses: return "degraded"
         return "nominal"
 
     def reset(self):
         """Full reset to initial nominal state."""
         with self._lock:
-            self.obc    = OBCState()
-            self.adcs   = ADCSState()
-            self.power  = PowerState()
-            self.comms  = CommsState()
+            self.obc            = OBCState()
+            self.adcs           = ADCSState()
+            self.power          = PowerState()
+            self.comms          = CommsState()
             self.fault_injected = None
             self.fault_detail   = {}
+            self._ring_buffer.clear()
         print("[Emulator] Full reset to nominal state")
 
 
-# ──────────────────────────────────────────────
-# Quick smoke test
-# ──────────────────────────────────────────────
+# ── Smoke test ────────────────────────────────
 
 if __name__ == "__main__":
     emulator = SatelliteEmulator(tick_interval=1.0)
     emulator.start()
 
-    print("\n--- Nominal telemetry (3s) ---")
+    print("\n--- Nominal (3s) ---")
     for _ in range(3):
         time.sleep(1)
-        frame = emulator.get_latest_frame()
-        print(f"  t={frame['timestamp']} | battery={frame['battery_pct']}% | adcs_rate={frame['adcs_rate_deg_s']} | health={emulator.get_overall_health()}")
+        f = emulator.get_latest_frame()
+        print(f"  t={f['timestamp']} | battery={f['battery_pct']}% | health={emulator.get_overall_health()} | buffer_size={len(emulator._ring_buffer)}")
 
-    print("\n--- Injecting SEU fault ---")
+    print("\n--- Inject SEU ---")
     emulator.inject_SEU("0x3F")
-    for _ in range(4):
+    for _ in range(3):
         time.sleep(1)
-        frame = emulator.get_latest_frame()
-        print(f"  t={frame['timestamp']} | adcs_rate={frame['adcs_rate_deg_s']} | adcs_status={frame['adcs_status']} | fault={frame['fault_injected']}")
+        f = emulator.get_latest_frame()
+        print(f"  adcs_rate={f['adcs_rate_deg_s']} | fault={f['fault_injected']}")
 
-    print("\n--- Applying recovery ---")
-    emulator.apply_recovery("ADCS_MEMORY_SCRUB_v2")
-    time.sleep(1)
-    frame = emulator.get_latest_frame()
-    print(f"  t={frame['timestamp']} | adcs_rate={frame['adcs_rate_deg_s']} | health={emulator.get_overall_health()}")
+    print(f"\n--- Ring buffer has {len(emulator._ring_buffer)} real frames ---")
+    history = emulator.get_frame_history(60)
+    print(f"  get_frame_history(60) returned {len(history)} frames ✓")
+
+    print("\n--- Recovery: OBC_HARD_RESET_v1 ---")
+    emulator.apply_recovery("OBC_HARD_RESET_v1")
+
+    print("\n--- Recovery: COMMS_HARD_RESET_v1 ---")
+    emulator.apply_recovery("COMMS_HARD_RESET_v1")
 
     emulator.stop()
+
+
+# ──────────────────────────────────────────────
+# Real Data Seeding (SatNOGS baselines)
+# ──────────────────────────────────────────────
+
+def seed_from_real_data(emulator: "SatelliteEmulator",
+                        n2yo_api_key: str = "",
+                        norad_id: int = 28654) -> bool:
+    """
+    Pull real SatNOGS telemetry for the target satellite and
+    seed the emulator's nominal baseline values from actual data.
+
+    Call this once at startup before emulator.start().
+
+    Returns True if real data was applied, False if defaults kept.
+    """
+    try:
+        import sys, os
+        sys.path.append(os.path.dirname(__file__))
+        from real_data_fetcher import RealDataFetcher
+
+        fetcher   = RealDataFetcher(n2yo_api_key=n2yo_api_key, norad_id=norad_id)
+        baselines = fetcher.get_satnogs_baselines(limit=50)
+
+        if not baselines:
+            print("[Emulator] No SatNOGS baselines found — using default nominal values")
+            return False
+
+        with emulator._lock:
+            if "battery_pct"   in baselines:
+                emulator.power.battery_pct    = baselines["battery_pct"]
+            if "obc_temp_c"    in baselines:
+                emulator.obc.temp_c           = baselines["obc_temp_c"]
+            if "power_w"       in baselines:
+                emulator.power.solar_output_w = baselines["power_w"]
+            if "bus_voltage_v" in baselines:
+                emulator.power.bus_voltage_v  = baselines["bus_voltage_v"]
+
+        print(f"[Emulator] Seeded from real SatNOGS data: {baselines}")
+        return True
+
+    except Exception as e:
+        print(f"[Emulator] Real data seeding failed: {e} — using defaults")
+        return False

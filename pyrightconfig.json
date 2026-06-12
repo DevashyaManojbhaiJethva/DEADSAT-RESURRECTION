@@ -1,0 +1,6 @@
+{
+  "extraPaths": ["emulator", "agents"],
+  "reportGeneralTypeIssues": "none",
+  "reportArgumentType": "none",
+  "reportCallIssue": "none"
+}
