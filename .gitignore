@@ -2,15 +2,28 @@
 __pycache__/
 *.py[cod]
 
-# Environment
-.env
+# Virtual environments
+env/
 venv/
 .venv/
-env/
+
+# Environment variables
+.env
 
 # VS Code
 .vscode/
 
-# OS
+# Logs
+*.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
 .DS_Store
 Thumbs.db
