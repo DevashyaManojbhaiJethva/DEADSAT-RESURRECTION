@@ -1,193 +1,251 @@
 {
   "info": {
     "name": "DeadSat Resurrection API",
-    "description": "Complete Postman collection for DeadSat Resurrection — AI-2 FastAPI server.\nBase URL: http://localhost:8000\n\nDemo flow:\n1. GET /health — confirm nominal\n2. POST /fault/inject — inject fault\n3. GET /telemetry — see fault in telemetry\n4. POST /recovery/trigger — run LangGraph agent\n5. GET /health — confirm recovery",
+    "description": "Complete test suite for DeadSat Resurrection — AI-2 FastAPI server.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
-  "variable": [
-    {
-      "key": "base_url",
-      "value": "http://localhost:8000",
-      "type": "string"
-    }
-  ],
   "item": [
     {
       "name": "1. Health Check",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{base_url}}/health",
-          "host": ["{{base_url}}"],
-          "path": ["health"]
-        },
-        "description": "Quick health summary for all 4 subsystems.\nExpect: all statuses = nominal"
-      }
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Response is valid JSON', () => pm.response.to.be.json);",
+        "const j = pm.response.json();",
+        "pm.test('Has overall field', () => pm.expect(j).to.have.property('overall'));",
+        "pm.test('Has all 4 subsystem statuses', () => {",
+        "  pm.expect(j).to.have.property('obc_status');",
+        "  pm.expect(j).to.have.property('adcs_status');",
+        "  pm.expect(j).to.have.property('power_status');",
+        "  pm.expect(j).to.have.property('comms_status');",
+        "});",
+        "pm.test('Battery pct is a number', () => pm.expect(j.battery_pct).to.be.a('number'));",
+        "pm.test('Frame ID is a number', () => pm.expect(j.frame_id).to.be.a('number'));"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/health"}
     },
     {
       "name": "2. Get Live Telemetry",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{base_url}}/telemetry",
-          "host": ["{{base_url}}"],
-          "path": ["telemetry"]
-        },
-        "description": "Full telemetry frame — OBC, ADCS, Power, Comms.\nFE-2 polls this every 1 second."
-      }
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Response is valid JSON', () => pm.response.to.be.json);",
+        "const j = pm.response.json();",
+        "pm.test('Has frame_id', () => pm.expect(j.frame_id).to.be.a('number'));",
+        "pm.test('Has timestamp', () => pm.expect(j.timestamp).to.be.a('number'));",
+        "pm.test('Has OBC fields', () => pm.expect(j).to.have.property('obc_status'));",
+        "pm.test('Has ADCS fields', () => pm.expect(j).to.have.property('adcs_status'));",
+        "pm.test('Has Power fields', () => pm.expect(j).to.have.property('power_status'));",
+        "pm.test('Has Comms fields', () => pm.expect(j).to.have.property('comms_status'));",
+        "pm.globals.set('last_frame', JSON.stringify(j));"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/telemetry"}
     },
     {
       "name": "3. Get Telemetry History (60 frames)",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{base_url}}/telemetry/history?n=60",
-          "host": ["{{base_url}}"],
-          "path": ["telemetry", "history"],
-          "query": [{ "key": "n", "value": "60" }]
-        },
-        "description": "Sliding window of last N frames.\nAI-1 classifier uses this for anomaly detection."
-      }
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Response is valid JSON', () => pm.response.to.be.json);",
+        "const j = pm.response.json();",
+        "pm.test('Has frames array', () => pm.expect(j.frames).to.be.an('array'));",
+        "pm.test('Has count field', () => pm.expect(j.count).to.be.a('number'));",
+        "pm.test('Frames array is not empty', () => pm.expect(j.frames.length).to.be.above(0));",
+        "pm.test('Each frame has frame_id', () => {",
+        "  j.frames.forEach(f => pm.expect(f.frame_id).to.be.a('number'));",
+        "});",
+        "pm.test('Each frame has timestamp', () => {",
+        "  j.frames.forEach(f => pm.expect(f.timestamp).to.be.a('number'));",
+        "});"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/telemetry/history?n=60"}
     },
     {
       "name": "4. Get Ground Contact Window",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{base_url}}/contact",
-          "host": ["{{base_url}}"],
-          "path": ["contact"]
-        },
-        "description": "Next ground contact window over Ahmedabad.\nPowered by N2YO live API if key is set, else sgp4 fallback."
-      }
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Response time < 5000ms', () => pm.expect(pm.response.responseTime).to.be.below(5000));",
+        "pm.test('Response is valid JSON', () => pm.response.to.be.json);",
+        "const j = pm.response.json();",
+        "pm.test('Has timestamp', () => pm.expect(j).to.have.property('timestamp'));",
+        "pm.test('Has ground_station', () => pm.expect(j.ground_station).to.be.a('string'));",
+        "pm.test('Has in_contact_now', () => pm.expect(j).to.have.property('in_contact_now'));",
+        "pm.test('Has source field', () => pm.expect(j).to.have.property('source'));",
+        "if (j.next_window) {",
+        "  pm.test('Next window has AOS', () => pm.expect(j.next_window).to.have.property('aos'));",
+        "  pm.test('Next window has duration', () => pm.expect(j.next_window.duration_seconds).to.be.a('number'));",
+        "}"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/contact"}
     },
     {
       "name": "5a. Inject Fault — SEU",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Response is valid JSON', () => pm.response.to.be.json);",
+        "const j = pm.response.json();",
+        "pm.test('Status is injected', () => pm.expect(j.status).to.eql('injected'));",
+        "pm.test('Fault type matches', () => pm.expect(j.fault_type).to.eql('SEU'));",
+        "pm.test('Has current_frame', () => pm.expect(j).to.have.property('current_frame'));"
+      ]}}],
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"fault_type\": \"SEU\",\n  \"register\": \"0x3F\"\n}"
-        },
-        "url": {
-          "raw": "{{base_url}}/fault/inject",
-          "host": ["{{base_url}}"],
-          "path": ["fault", "inject"]
-        },
-        "description": "Inject Single Event Upset — cosmic ray bit flip.\nADCS rate will spike, pointing error grows."
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {"mode": "raw", "raw": "{\"fault_type\": \"SEU\", \"register\": \"0x3F\"}"},
+        "url": "http://localhost:8000/fault/inject"
       }
     },
     {
       "name": "5b. Inject Fault — Software Bug",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "const j = pm.response.json();",
+        "pm.test('Status is injected', () => pm.expect(j.status).to.eql('injected'));",
+        "pm.test('Fault type matches', () => pm.expect(j.fault_type).to.eql('software_bug'));"
+      ]}}],
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"fault_type\": \"software_bug\"\n}"
-        },
-        "url": {
-          "raw": "{{base_url}}/fault/inject",
-          "host": ["{{base_url}}"],
-          "path": ["fault", "inject"]
-        },
-        "description": "OBC crash loop — CPU runaway, memory corruption, downlink drops."
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {"mode": "raw", "raw": "{\"fault_type\": \"software_bug\"}"},
+        "url": "http://localhost:8000/fault/inject"
       }
     },
     {
       "name": "5c. Inject Fault — Firmware Corruption",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "const j = pm.response.json();",
+        "pm.test('Status is injected', () => pm.expect(j.status).to.eql('injected'));",
+        "pm.test('Fault type matches', () => pm.expect(j.fault_type).to.eql('firmware_corruption'));"
+      ]}}],
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"fault_type\": \"firmware_corruption\"\n}"
-        },
-        "url": {
-          "raw": "{{base_url}}/fault/inject",
-          "host": ["{{base_url}}"],
-          "path": ["fault", "inject"]
-        },
-        "description": "Firmware image corrupted — all subsystems degrading, comms down."
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {"mode": "raw", "raw": "{\"fault_type\": \"firmware_corruption\"}"},
+        "url": "http://localhost:8000/fault/inject"
       }
     },
     {
       "name": "5d. Inject Fault — Command Injection",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "const j = pm.response.json();",
+        "pm.test('Status is injected', () => pm.expect(j.status).to.eql('injected'));",
+        "pm.test('Fault type matches', () => pm.expect(j.fault_type).to.eql('command_injection'));"
+      ]}}],
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"fault_type\": \"command_injection\",\n  \"payload\": \"ROGUE_CMD_0xDEAD\"\n}"
-        },
-        "url": {
-          "raw": "{{base_url}}/fault/inject",
-          "host": ["{{base_url}}"],
-          "path": ["fault", "inject"]
-        },
-        "description": "Unsigned rogue command injected — comms compromised, power draining."
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {"mode": "raw", "raw": "{\"fault_type\": \"command_injection\", \"payload\": \"ROGUE_CMD_0xDEAD\"}"},
+        "url": "http://localhost:8000/fault/inject"
+      }
+    },
+    {
+      "name": "5e. Reset Before Recovery",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Status is reset', () => pm.expect(pm.response.json().status).to.eql('reset'));"
+      ]}}],
+      "request": {"method": "POST", "url": "http://localhost:8000/reset"}
+    },
+    {
+      "name": "5f. Inject SEU for Recovery Test",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('SEU injected', () => pm.expect(pm.response.json().status).to.eql('injected'));"
+      ]}}],
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {"mode": "raw", "raw": "{\"fault_type\": \"SEU\", \"register\": \"0x3F\"}"},
+        "url": "http://localhost:8000/fault/inject"
       }
     },
     {
       "name": "6. Trigger Recovery (LangGraph Agent)",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Response is valid JSON', () => pm.response.to.be.json);",
+        "const j = pm.response.json();",
+        "pm.test('Has status field', () => pm.expect(j).to.have.property('status'));",
+        "pm.test('Recovery acknowledged', () => pm.expect(j.status).to.eql('recovery_started'));",
+        "pm.test('Has fault_type', () => pm.expect(j.fault_type).to.eql('SEU'));"
+      ]}}],
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"fault_type\": \"SEU\",\n  \"fault_detail\": {\n    \"register\": \"0x3F\",\n    \"bit_flipped\": 3,\n    \"subsystem\": \"ADCS\"\n  },\n  \"telemetry_frame\": {}\n}"
-        },
-        "url": {
-          "raw": "{{base_url}}/recovery/trigger",
-          "host": ["{{base_url}}"],
-          "path": ["recovery", "trigger"]
-        },
-        "description": "Kick off the LangGraph 9-step recovery agent.\nReturns immediately — agent runs in background.\nWatch terminal for live node-by-node logs.\nChange fault_type to match whatever was injected."
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {"mode": "raw", "raw": "{\n  \"fault_type\": \"SEU\",\n  \"fault_detail\": {\"register\": \"0x3F\", \"bit_flipped\": 3, \"subsystem\": \"ADCS\"},\n  \"telemetry_frame\": {},\n  \"confidence\": 0.95,\n  \"norad_id\": 28654\n}"},
+        "url": "http://localhost:8000/recovery/trigger"
       }
     },
     {
-      "name": "7. Check Recovery (Health)",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{base_url}}/health",
-          "host": ["{{base_url}}"],
-          "path": ["health"]
-        },
-        "description": "Poll after recovery trigger.\nExpect: overall = nominal within 30-90 seconds."
-      }
+      "name": "7. Wait and Check Recovery (Health)",
+      "event": [{"listen": "prerequest", "script": {"exec": ["setTimeout(() => {}, 8000);"]}},
+       {"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "const j = pm.response.json();",
+        "pm.test('Has overall field', () => pm.expect(j).to.have.property('overall'));",
+        "pm.test('OBC nominal', () => pm.expect(j.obc_status).to.eql('nominal'));",
+        "pm.test('ADCS nominal', () => pm.expect(j.adcs_status).to.eql('nominal'));",
+        "pm.test('Power nominal', () => pm.expect(j.power_status).to.eql('nominal'));",
+        "pm.test('Comms nominal', () => pm.expect(j.comms_status).to.eql('nominal'));"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/health"}
     },
     {
       "name": "8. Reset Satellite",
-      "request": {
-        "method": "POST",
-        "header": [],
-        "url": {
-          "raw": "{{base_url}}/reset",
-          "host": ["{{base_url}}"],
-          "path": ["reset"]
-        },
-        "description": "Full reset to nominal state.\nUse between demo runs."
-      }
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Status is reset', () => pm.expect(pm.response.json().status).to.eql('reset'));",
+        "pm.test('Has frame in response', () => pm.expect(pm.response.json()).to.have.property('frame'));"
+      ]}}],
+      "request": {"method": "POST", "url": "http://localhost:8000/reset"}
     },
     {
-      "name": "9. API Docs (Swagger)",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{base_url}}/docs",
-          "host": ["{{base_url}}"],
-          "path": ["docs"]
-        },
-        "description": "Interactive Swagger UI — test all endpoints from the browser."
-      }
+      "name": "9. Catalog Stats",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "const j = pm.response.json();",
+        "pm.test('Has total_satellites', () => pm.expect(j.total_satellites).to.be.above(0));",
+        "pm.test('Has 712 satellites', () => pm.expect(j.total_satellites).to.eql(712));"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/catalog/stats"}
+    },
+    {
+      "name": "10. Catalog — NOAA-18 Lookup",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "const j = pm.response.json();",
+        "pm.test('Correct NORAD ID', () => pm.expect(j.norad_id).to.eql(28654));",
+        "pm.test('Has TLE', () => pm.expect(j.tle).to.have.property('line1'));",
+        "pm.test('Has orbital elements', () => pm.expect(j).to.have.property('orbital_elements'));",
+        "pm.test('Has anomaly baselines', () => pm.expect(j).to.have.property('anomaly_baselines'));"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/catalog/satellite/28654"}
+    },
+    {
+      "name": "11. Catalog Search — ISS",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "const j = pm.response.json();",
+        "pm.test('Has results array', () => pm.expect(j.results).to.be.an('array'));",
+        "pm.test('Found ISS', () => pm.expect(j.count).to.be.above(0));"
+      ]}}],
+      "request": {"method": "GET", "url": "http://localhost:8000/catalog/search?name=ISS"}
+    },
+    {
+      "name": "12. Demo Start (Lock Seed)",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Demo active', () => pm.expect(pm.response.json().status).to.eql('demo_active'));",
+        "pm.test('Seed locked', () => pm.expect(pm.response.json().seed_locked).to.eql(true));"
+      ]}}],
+      "request": {"method": "POST", "url": "http://localhost:8000/demo/start"}
+    },
+    {
+      "name": "13. Demo End",
+      "event": [{"listen": "test", "script": {"exec": [
+        "pm.test('Status code is 200', () => pm.response.to.have.status(200));",
+        "pm.test('Demo ended', () => pm.expect(pm.response.json().status).to.eql('demo_ended'));"
+      ]}}],
+      "request": {"method": "POST", "url": "http://localhost:8000/demo/end"}
     }
   ]
 }
