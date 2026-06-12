@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 
 sys.path.append(str(Path(__file__).parent / "emulator"))
 sys.path.append(str(Path(__file__).parent / "agent"))
+sys.path.append(str(Path(__file__).parent / "agents"))   # correct folder name
 
 import os
 from satellite_emulator import SatelliteEmulator, FaultType, seed_from_real_data

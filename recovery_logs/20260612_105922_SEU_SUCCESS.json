@@ -1,0 +1,105 @@
+{
+  "fault_type": "SEU",
+  "fault_confidence": 1.0,
+  "norad_id": 28654,
+  "catalog_baselines": {
+    "norad_id": 28654,
+    "name": "NOAA 18",
+    "mean_motion_nominal": 14.13728072,
+    "mean_motion_dot": 3.2e-07,
+    "eccentricity": 0.00145752,
+    "inclination_deg": 98.8112,
+    "bstar": 3.9965512e-05,
+    "period_minutes": 101.86,
+    "altitude_km_approx": 853.8,
+    "mm_threshold": 0.706864,
+    "ecc_threshold": 0.001,
+    "source": "csv_gp"
+  },
+  "procedure_used": "ADCS_MEMORY_SCRUB_v2",
+  "attempts": 1,
+  "success": true,
+  "recovery_log": [
+    {
+      "step": "load_procedures",
+      "status": "ok",
+      "catalog_baselines": {
+        "norad_id": 28654,
+        "name": "NOAA 18",
+        "mean_motion_nominal": 14.13728072,
+        "mean_motion_dot": 3.2e-07,
+        "eccentricity": 0.00145752,
+        "inclination_deg": 98.8112,
+        "bstar": 3.9965512e-05,
+        "period_minutes": 101.86,
+        "altitude_km_approx": 853.8,
+        "mm_threshold": 0.706864,
+        "ecc_threshold": 0.001,
+        "source": "csv_gp"
+      },
+      "ts": "2026-06-12T10:59:15.717668+00:00"
+    },
+    {
+      "step": "select_procedure",
+      "procedure": "ADCS_MEMORY_SCRUB_v2",
+      "priority": 1,
+      "min_confidence": 0.75,
+      "fault_confidence": 1.0,
+      "baseline_note": "Satellite nominal altitude ~853.8km. Current battery: 91.27%. Fault pattern consistent with SEU.",
+      "ts": "2026-06-12T10:59:15.719838+00:00"
+    },
+    {
+      "step": "generate_commands",
+      "count": 5,
+      "commands": [
+        "ADCS_SAFE_HOLD",
+        "OBC_SCRUB_REGISTER",
+        "ADCS_RESET_ESTIMATOR",
+        "ADCS_RELOAD_PARAMS",
+        "ADCS_RESUME_CONTROL"
+      ],
+      "ts": "2026-06-12T10:59:15.722120+00:00"
+    },
+    {
+      "step": "request_signing",
+      "status": "ok",
+      "mock": true,
+      "ts": "2026-06-12T10:59:19.914212+00:00"
+    },
+    {
+      "step": "schedule_uplink",
+      "in_contact": false,
+      "allowed": true,
+      "window": {
+        "satellite": "NOAA 18",
+        "ground_station": "Ahmedabad Ground Station",
+        "aos": "2026-06-12T16:02:51.043535+00:00",
+        "los": "2026-06-12T16:16:11.043535+00:00",
+        "max_elevation_deg": 75.37,
+        "duration_seconds": 800,
+        "in_contact_now": false
+      },
+      "ts": "2026-06-12T10:59:21.058228+00:00"
+    },
+    {
+      "step": "uplink_commands",
+      "procedure": "ADCS_MEMORY_SCRUB_v2",
+      "commands_sent": 5,
+      "ts": "2026-06-12T10:59:21.081694+00:00"
+    },
+    {
+      "step": "monitor_recovery",
+      "result": "SUCCESS",
+      "polls": 1,
+      "health": "nominal",
+      "ts": "2026-06-12T10:59:22.083486+00:00"
+    },
+    {
+      "step": "final_report",
+      "result": "SUCCESS",
+      "procedure": "ADCS_MEMORY_SCRUB_v2",
+      "attempts": 1,
+      "ts": "2026-06-12T10:59:22.083999+00:00"
+    }
+  ]
+}

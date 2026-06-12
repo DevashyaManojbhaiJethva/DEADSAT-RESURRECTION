@@ -42,7 +42,21 @@ from contact_calculator import ContactCalculator
 # Config
 # ──────────────────────────────────────────────
 
-PROCEDURE_LIBRARY_PATH = Path(__file__).parent / "procedure_library.json"
+# Find procedure library — works whether file is in agents/ or root
+def _find_procedure_library() -> Path:
+    candidates = [
+        Path(__file__).parent / "procedure_library.json",           # agents/procedure_library.json
+        Path(__file__).parent.parent / "agents" / "procedure_library.json",  # ../agents/
+        Path(__file__).parent.parent / "procedure_library.json",    # root
+        Path.cwd() / "agents" / "procedure_library.json",           # cwd/agents/
+        Path.cwd() / "procedure_library.json",                      # cwd/
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0]  # fallback
+
+PROCEDURE_LIBRARY_PATH = _find_procedure_library()
 SIGNING_ENDPOINT       = "http://localhost:8001/sign"
 FASTAPI_BASE           = "http://localhost:8000"
 POLL_INTERVAL_S        = 1.0
@@ -666,5 +680,3 @@ if __name__ == "__main__":
     print("\n=== Final Result ===")
     print(json.dumps(result, indent=2, default=str))
     emulator.stop()
-
-    
