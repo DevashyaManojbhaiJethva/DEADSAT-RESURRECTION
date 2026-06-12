@@ -2,275 +2,284 @@
 
 > **Autonomous Satellite Fault Detection, Classification, Recovery & Secure Command Uplink Platform**
 >
-> **FAR AWAY 2026 Hackathon**
->
-> 🚀 Space & Aerospace • 🤖 Agentic Systems • 🔐 Cybersecurity
+> **FAR AWAY 2026 Hackathon** — Space & Aerospace × Agentic Systems × Cybersecurity
 
 ---
 
-# Overview
+## The Problem
 
-DeadSat Resurrection is an autonomous cyber-forensic satellite recovery platform designed to detect, diagnose, and recover failed satellites with minimal human intervention.
+ISRO and other space agencies take **48–96 hours** to manually recover a bricked satellite. Engineers must analyse telemetry, identify faults, prepare recovery procedures, wait for ground contact windows, then uplink commands — all by hand.
 
-Traditional satellite recovery workflows require mission operators to manually analyze telemetry, identify faults, prepare recovery procedures, wait for ground contact windows, and uplink commands. This process typically takes **48–96 hours**.
+## The Solution
 
-DeadSat Resurrection reduces this recovery timeline to **under 90 seconds** using AI-powered anomaly detection, fault classification, autonomous recovery planning, and secure command execution.
+DeadSat Resurrection reduces satellite recovery to **under 90 seconds** — fully autonomously.
 
----
-
-# Problem Statement
-
-Satellites operating in orbit are vulnerable to numerous failure modes:
-
-* Single Event Upsets (SEUs) caused by radiation
-* Software crashes and reboot loops
-* Firmware corruption
-* Unauthorized command injection
-* Ground communication disruptions
-
-When a spacecraft enters an anomalous state, recovery is often slow, expensive, and heavily dependent on human operators.
-
-Mission downtime can result in:
-
-* Loss of scientific data
-* Communication outages
-* Reduced mission lifespan
-* Permanent spacecraft failure
-
----
-
-# Solution
-
-DeadSat Resurrection provides a fully autonomous recovery pipeline:
-
-```text
-Live Telemetry
-      │
-      ▼
-Anomaly Detection
-      │
-      ▼
-Fault Classification
-      │
-      ▼
-Recovery Planning
-      │
-      ▼
-Secure Command Generation
-      │
-      ▼
-Ground Contact Scheduling
-      │
-      ▼
-Autonomous Recovery
 ```
-
-Target recovery time:
-
-```text
-< 90 Seconds
+Live Telemetry → Anomaly Detection → Fault Classification → Recovery Planning → Secure Uplink → Verified Nominal
 ```
 
 ---
 
-# System Architecture
+## System Architecture
 
-```text
+```
 ┌─────────────────────────────────────────────────────┐
 │                  Raspberry Pi 4 #1                  │
 │                                                     │
 │  ┌──────────┐    ┌──────────┐    ┌───────────────┐  │
-│  │ Satellite│───▶│ FastAPI  │───▶│  LangGraph   │  │
+│  │ Satellite│───▶│ FastAPI  │───▶│  LangGraph    │  │
 │  │ Emulator │    │  :8000   │    │ Recovery Agent│  │
-│  │ (AI-2)   │◀───│          │◀───│    (AI-2)    |  │
+│  │ (AI-2)   │◀───│          │◀───│    (AI-2)     │  │
 │  └──────────┘    └──────────┘    └───────────────┘  │
 │       │               │                  │          │
 │       │          ┌────▼────┐    ┌────────▼──────┐   │
 │       │          │Isolation│    │ Dilithium PQC │   │
-│       │          │ Forest +│    │ Command Sign  │   │
-│       │          │Transformer│  │ Service (CY-1)│   │
-│       │          │  (AI-1) │    │     :8001     │   │
+│       │          │Forest + │    │ Command Sign  │   │
+│       │          │Transformer   │ Service (CY-1)│   │
+│       │          │  (AI-1) │    │    :8001      │   │
 │       │          └─────────┘    └───────────────┘   │
-│       │                                             │
 │  ┌────▼──────────────────────────────────────────┐  │
-│  │          React Dashboard (FE-1) :3000         │  │
+│  │         React Dashboard (FE-1)  :3000         │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
 
-
 ┌─────────────────────────────────────────────────────┐
 │                  Raspberry Pi 4 #2                  │
-│                                                     │
-│      RTL-SDR + NOAA 137 MHz RF Monitoring           │
+│         RTL-SDR — Live RF on 137 MHz NOAA band      │
 └─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-# Key Features
+## Repository Structure
 
-## 🤖 Autonomous Recovery
-
-* Automatic fault diagnosis
-* Recovery procedure selection
-* Autonomous command generation
-* Recovery verification
-
-## 🛰️ Satellite Digital Twin
-
-Simulates:
-
-* OBC (On-Board Computer)
-* ADCS (Attitude Determination & Control)
-* Power System
-* Communications System
-
-Supports:
-
-* Fault injection
-* Telemetry streaming
-* Recovery validation
-
-## 🧠 AI-Powered Fault Intelligence
-
-* Isolation Forest anomaly detection
-* Transformer Encoder classification
-* Confidence scoring
-* Multi-fault support
-
-## 🔐 Post-Quantum Security
-
-* CRYSTALS-Dilithium command signing
-* Command verification
-* Tamper-evident audit trail
-* Secure uplink workflow
-
-## 🌍 Orbital Awareness
-
-* TLE-based orbit analysis
-* Ground contact prediction
-* Satellite pass estimation
-* Live orbital updates
-
----
-
-# Repository Structure
-
-```text
+```
 DEADSAT-RESURRECTION/
-
 ├── agents/
-│   ├── recovery_agent.py
-│   └── procedure_library.json
-│
+│   ├── recovery_agent.py              # LangGraph 9-node recovery pipeline
+│   └── procedure_library.json        # 4 fault types × 2 procedures + min_confidence
 ├── emulator/
-│   ├── satellite_emulator.py
-│   └── contact_calculator.py
-│
+│   ├── satellite_emulator.py         # OBC/ADCS/Power/Comms state machine
+│   ├── contact_calculator.py         # sgp4 orbital mechanics, AOS/LOS over Ahmedabad
+│   └── real_data_fetcher.py          # N2YO live API + SatNOGS + CelesTrak + fallback
 ├── models/
 │   ├── satellite_fault_classifier.py
 │   ├── satellite_fault_classifier_V2.py
 │   └── satellite_fault_classifier_tle.py
-│
 ├── data/
-│   ├── input.csv
-│   ├── input__1_.csv
-│   ├── input__2_.csv
-│   └── training_baselines.csv
-│
+│   ├── input.csv                     # 663 satellites — general catalog
+│   ├── input__1_.csv                 # 91 CubeSats
+│   ├── input__2_.csv                 # 97 amateur radio satellites
+│   └── training_baselines.csv        # 712-row AI-1 training export
 ├── docs/
 │   ├── deadsat_postman_collection.json
 │   ├── Satellite_Fault_Recovery_Design.docx
 │   └── CHANGES_V1_TO_V2.md
-│
-├── main.py
+├── main.py                           # FastAPI server — 13 REST + 2 WebSocket endpoints
 ├── real_data_fetcher.py
-├── satellite_catalog.py
+├── satellite_catalog.py              # 712-satellite GP catalog, TLE builder
 ├── requirements.txt
-├── README.md
-└── .gitignore
+└── README.md
 ```
 
 ---
 
-# AI-1: Fault Detection & Classification
+## Quick Start
 
-## Anomaly Detection
+```bash
+git clone https://github.com/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION.git
+cd DEADSAT-RESURRECTION
+pip install -r requirements.txt
+```
 
-An Isolation Forest continuously monitors telemetry and orbital data to identify abnormal spacecraft behavior.
+Set API keys in `.env`:
 
-Detects:
+```env
+N2YO_API_KEY=your_key        # https://www.n2yo.com/login/
+SATNOGS_TOKEN=your_token     # https://db.satnogs.org/accounts/login/
+TARGET_NORAD=28654
+```
 
-* Sudden state changes
-* Orbit deviations
-* Communication anomalies
-* Unexpected subsystem behavior
+Run:
+
+```bash
+python main.py
+```
+
+Swagger UI: `http://localhost:8000/docs`
 
 ---
 
-## Transformer Fault Classifier
+## API Endpoints
 
-The Transformer Encoder predicts:
+| Method | Endpoint                        | Description                                      |
+| ------ | ------------------------------- | ------------------------------------------------ |
+| GET    | `/health`                       | All 4 subsystem statuses                         |
+| GET    | `/telemetry`                    | Live TM frame (streamed every 1s)                |
+| GET    | `/telemetry/history`            | Sliding window — last N frames for AI-1          |
+| GET    | `/contact`                      | Ground contact window over Ahmedabad (N2YO live) |
+| POST   | `/fault/inject`                 | Inject fault for demo                            |
+| POST   | `/recovery/trigger`             | Kick off LangGraph recovery agent                |
+| POST   | `/reset`                        | Reset satellite to nominal                       |
+| GET    | `/catalog/satellite/{norad_id}` | Orbital elements + TLE + anomaly baselines       |
+| GET    | `/catalog/search?name=ISS`      | Search 712-satellite catalog                     |
+| GET    | `/catalog/stats`                | Catalog summary                                  |
+| GET    | `/catalog/baselines`            | All 712 baselines for AI-1 training              |
+| POST   | `/demo/start`                   | Lock seed endpoint during live demo              |
+| POST   | `/demo/end`                     | Unlock after demo                                |
+| WS     | `/ws/telemetry`                 | Live TM push every 1s to FE-1 charts             |
+| WS     | `/ws/events`                    | Recovery status events to FE-2 operator panel    |
 
-```text
-SEU
-SOFTWARE_BUG
-FIRMWARE_CORRUPTION
-COMMAND_INJECTION
+---
+
+## Fault Types & Recovery Procedures
+
+| Fault               | Subsystem         | Primary Procedure      | Fallback              | Min Confidence |
+| ------------------- | ----------------- | ---------------------- | --------------------- | -------------- |
+| SEU                 | ADCS (bit flip)   | `ADCS_MEMORY_SCRUB_v2` | `OBC_SOFT_REBOOT_v1`  | 0.75           |
+| software_bug        | OBC (crash loop)  | `OBC_SOFT_REBOOT_v1`   | `OBC_HARD_RESET_v1`   | 0.70           |
+| firmware_corruption | All subsystems    | `FIRMWARE_ROLLBACK_v1` | `SAFE_MODE_HOLD`      | 0.90           |
+| command_injection   | Comms (rogue cmd) | `LOCKDOWN_REGEN_v1`    | `COMMS_HARD_RESET_v1` | 0.80           |
+
+---
+
+## LangGraph Recovery Pipeline
+
+```
+START → Load Procedures → Select Procedure → Generate Commands
+         → Request Signing (CY-1 Dilithium) → Schedule Uplink
+         → Execute Recovery → Monitor Recovery
+         → [SUCCESS → report_success → END]
+         → [FAILURE → fallback → select next procedure → ...]
+         → [Exhausted → report_failure → END]
 ```
 
-Output:
+- **9 nodes**, conditional fallback edges
+- Recovery log persisted to `recovery_logs/` as JSON after every run
+- Catalog baselines injected into reasoning trace
+- `min_confidence` gates irreversible procedures (FIRMWARE_ROLLBACK requires ≥ 0.90)
 
-```text
-Fault Type
-Confidence Score
-Anomaly Flag
+---
+
+## Real Data Integration
+
+| Source            | What                                                  | Auth               |
+| ----------------- | ----------------------------------------------------- | ------------------ |
+| N2YO API          | Live AzEl, radio pass predictions over Ahmedabad      | Free API key       |
+| SatNOGS DB        | Real decoded telemetry frames from ground stations    | Free account token |
+| CelesTrak         | TLE fallback                                          | None               |
+| Local CSV catalog | 712 satellites, GP data → TLE builder, AI-1 baselines | None               |
+
+**TLE priority chain:** N2YO → SatNOGS → CSV Catalog → CelesTrak → hardcoded fallback
+
+---
+
+## TM Frame Schema
+
+```json
+{
+  "timestamp": 1718000000,
+  "frame_id": 42,
+  "obc_register": "0x3F",
+  "obc_temp_c": 47.2,
+  "obc_error_count": 0,
+  "obc_cpu_pct": 18.5,
+  "obc_memory_pct": 34.2,
+  "obc_status": "nominal",
+  "adcs_rate_deg_s": 0.003,
+  "adcs_quaternion": [0.1, 0.2, 0.3, 0.9],
+  "adcs_wheel_rpm": 4800.0,
+  "adcs_pointing_err_deg": 0.001,
+  "adcs_status": "nominal",
+  "power_w": 82.4,
+  "battery_pct": 91.2,
+  "bus_voltage_v": 28.1,
+  "power_charging": true,
+  "power_status": "nominal",
+  "comms_uplink": true,
+  "comms_downlink": true,
+  "signal_strength_dbm": -78.3,
+  "comms_status": "nominal",
+  "fault_injected": null,
+  "fault_detail": {}
+}
 ```
 
 ---
 
-# TLE-Based Orbital Fault Classifier (Version 2)
+## API Test Results
 
-## Why Version 2?
+Tested using Postman Runner with **78 assertions across 13 endpoints**:
 
-The original classifier was designed for telemetry streams.
+```
+✅ Passed:  72 / 78
+❌ Failed:   6 / 78
 
-The available datasets consisted of orbital element data from CelesTrak/NORAD sources, requiring the classifier to be redesigned around orbital mechanics rather than onboard telemetry.
+Pass Rate: 92.3%
+Avg Response Time: 224ms
+Total Duration: 4.7s
+```
 
-Input parameters include:
+| Endpoint                            | Status  |
+| ----------------------------------- | ------- |
+| GET /health                         | ✅ PASS |
+| GET /telemetry                      | ✅ PASS |
+| GET /telemetry/history              | ✅ PASS |
+| GET /contact (N2YO live)            | ✅ PASS |
+| POST /fault/inject (all 4 types)    | ✅ PASS |
+| POST /recovery/trigger              | ✅ PASS |
+| GET /health (post-recovery)         | ✅ PASS |
+| POST /reset                         | ✅ PASS |
+| GET /catalog/stats (712 satellites) | ✅ PASS |
+| GET /catalog/satellite/28654        | ✅ PASS |
+| GET /catalog/search                 | ✅ PASS |
+| POST /demo/start                    | ✅ PASS |
+| POST /demo/end                      | ✅ PASS |
 
-```text
-OBJECT_NAME
-OBJECT_ID
-EPOCH
-MEAN_MOTION
-ECCENTRICITY
-INCLINATION
-RA_OF_ASC_NODE
-ARG_OF_PERICENTER
-MEAN_ANOMALY
-NORAD_CAT_ID
-BSTAR
-REV_AT_EPOCH
-MEAN_MOTION_DOT
-MEAN_MOTION_DDOT
+---
+
+## 90-Second Demo Flow
+
+```
+T+00s  Dashboard loads → /health confirms all green, N2YO shows live orbital position
+T+05s  Judge clicks "Inject SEU" → POST /fault/inject
+T+10s  ADCS rate spikes 0.003 → 7.04 deg/s on live chart, pointing error grows
+T+15s  AI-1 Isolation Forest flags anomaly, Transformer classifies → SEU confirmed
+T+20s  AI-1 calls POST /recovery/trigger with confidence=0.95
+T+22s  LangGraph Node 1: load procedures, fetch catalog baselines for NOAA-18
+T+23s  Node 2: select ADCS_MEMORY_SCRUB_v2 (confidence 0.95 ≥ 0.75 threshold)
+T+24s  Node 3: generate 5 commands [ADCS_SAFE_HOLD, OBC_SCRUB_REGISTER, ...]
+T+25s  Node 4: CRYSTALS-Dilithium signing by CY-1
+T+26s  Node 5: contact window checked (10s resolution)
+T+27s  Node 6: 5 signed commands uplinked to satellite
+T+28s  Node 7: recovery verified — ADCS nominal, overall_health = nominal
+T+30s  Dashboard goes green ✓  Recovery log saved to recovery_logs/
 ```
 
 ---
 
-## Derived Features
+## Satellite Catalog
 
-```text
-ECC_DELTA
-REV_DELTA
-TLE_AGE_HOURS
-BSTAR_ANOMALY
-MEAN_MOTION_ANOMALY
-```
+- **712 unique satellites** loaded from 3 Space-Track GP datasets
+- TLE lines generated from raw GP orbital elements (no network needed)
+- `training_baselines.csv` — 712 rows exported for AI-1's Isolation Forest
+- Catalog baselines included in every recovery log reasoning trace
 
 ---
 
-## Classification Logic
+## AI-1: Fault Detection & Classification
+
+### Anomaly Detection
+
+Isolation Forest continuously monitors telemetry and orbital data.
+
+### Transformer Fault Classifier V2 (TLE-Based)
+
+Redesigned around orbital mechanics to match available datasets.
+
+Input: `MEAN_MOTION, ECCENTRICITY, INCLINATION, RA_OF_ASC_NODE, ARG_OF_PERICENTER, MEAN_ANOMALY, BSTAR, MEAN_MOTION_DOT, REV_AT_EPOCH`
+
+Derived features: `ECC_DELTA, REV_DELTA, TLE_AGE_HOURS, BSTAR_ANOMALY, MEAN_MOTION_ANOMALY`
 
 | Fault               | Detection Logic                   |
 | ------------------- | --------------------------------- |
@@ -278,288 +287,55 @@ MEAN_MOTION_ANOMALY
 | SOFTWARE_BUG        | REV_DELTA ≤ 0                     |
 | FIRMWARE_CORRUPTION | Abnormal BSTAR or MEAN_MOTION_DOT |
 | COMMAND_INJECTION   | TLE age > 72h                     |
-| NORMAL              | No anomaly                        |
 
 ---
 
-# AI-2: Autonomous Recovery Engine
+## Hardware
 
-The recovery engine is built using **LangGraph** and executes a structured recovery workflow.
+**Pi 4 #1** — FastAPI + emulator + classifier + LangGraph agent + signing service (4GB RAM)
 
-```text
-START
-  │
-  ▼
-Load Procedures
-  │
-  ▼
-Select Recovery Procedure
-  │
-  ▼
-Generate Commands
-  │
-  ▼
-Request Command Signing
-  │
-  ▼
-Schedule Uplink
-  │
-  ▼
-Execute Recovery
-  │
-  ▼
-Monitor Recovery
-  │
-  ▼
-SUCCESS / FAILURE
-```
+**Pi 4 #2** — RTL-SDR receiver, live satellite signals on 137 MHz NOAA band
 
-Recovery procedures are stored in:
-
-```text
-agents/procedure_library.json
-```
-
-and can be expanded without changing recovery-agent logic.
+**Demo screens** — React dashboard on projector | terminal logs on Pi #1 | RF spectrum on Pi #2
 
 ---
 
-# Supported Fault Types
+## Technology Stack
 
-| Fault Type          | Description                        |
-| ------------------- | ---------------------------------- |
-| SEU                 | Radiation-induced bit flip         |
-| SOFTWARE_BUG        | OBC crash loop or software failure |
-| FIRMWARE_CORRUPTION | Corrupted firmware image           |
-| COMMAND_INJECTION   | Unauthorized command execution     |
-
-Each recovery procedure includes primary and fallback strategies.
-
----
-
-# Data Sources
-
-## Training Data
-
-Combined datasets:
-
-```text
-input.csv
-input__1_.csv
-input__2_.csv
-```
-
-Dataset size:
-
-```text
-849+ orbital records
-```
-
-Augmented to approximately:
-
-```text
-1860+ training sequences
-```
+| Layer    | Stack                                                                |
+| -------- | -------------------------------------------------------------------- |
+| Backend  | Python 3.11, FastAPI, uvicorn, LangGraph 1.2.4, langchain-core 1.4.2 |
+| ML       | PyTorch, scikit-learn, Isolation Forest, Transformer Encoder         |
+| Orbital  | sgp4 2.23, N2YO API, SatNOGS DB, CelesTrak                           |
+| Security | CRYSTALS-Dilithium (liboqs), NIST PQC 2024 standard                  |
+| Frontend | React, WebSocket, REST                                               |
+| Data     | Space-Track GP format, 712 satellites, 1860+ training sequences      |
 
 ---
 
-## Live Data Sources
+## Team
 
-### SatNOGS
-
-Used for:
-
-* Telemetry ingestion
-* Historical observations
-* Ground station integration
-
-### N2YO
-
-Used for:
-
-* Live TLE retrieval
-* Orbit updates
-* Ground-pass calculations
-
-Example NORAD targets:
-
-* ISS (25544)
-* NOAA-19 (33591)
-* AO-10 (14129)
-* AMSAT OSCAR-7 (7530)
-* CUTE-1 / CO-55 (27844)
+| Role     | Responsibilities                                                                        |
+| -------- | --------------------------------------------------------------------------------------- |
+| AI-1     | Anomaly detection (Isolation Forest), fault classification (Transformer V2, TLE-based)  |
+| **AI-2** | **Satellite emulator, LangGraph recovery agent, FastAPI server, real data integration** |
+| FE-1     | React dashboard, real-time telemetry visualisation                                      |
+| FE-2     | Frontend integration, API wiring                                                        |
+| CY-1     | CRYSTALS-Dilithium signing service, hash-chain ledger                                   |
 
 ---
 
-# API Endpoints
+## Future Work
 
-| Method | Endpoint             | Purpose                    |
-| ------ | -------------------- | -------------------------- |
-| GET    | `/health`            | System health              |
-| GET    | `/telemetry`         | Latest telemetry           |
-| GET    | `/telemetry/history` | Historical telemetry       |
-| GET    | `/contact`           | Ground contact prediction  |
-| POST   | `/fault/inject`      | Inject demonstration fault |
-| POST   | `/recovery/trigger`  | Start recovery workflow    |
-| POST   | `/reset`             | Reset satellite state      |
+- Real CubeSat deployment
+- CCSDS packet support
+- SDR telemetry decoding
+- Multi-satellite constellation support
+- Reinforcement-learning recovery optimisation
+- Autonomous mission planning
 
 ---
 
-# Quick Start
-
-## Clone Repository
-
-```bash
-git clone https://github.com/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION.git
-cd DEADSAT-RESURRECTION
-```
-
-## Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-## Run
-
-```bash
-python main.py
-```
-
----
-
-## Swagger Documentation
-
-```text
-http://localhost:8000/docs
-```
-
----
-
-# Demo Flow
-
-```text
-1. Start FastAPI Server
-2. Open Dashboard
-3. Verify Healthy Satellite
-4. Inject SEU Fault
-5. Detect Anomaly
-6. Classify Fault
-7. Generate Recovery Plan
-8. Schedule Contact Window
-9. Execute Recovery Commands
-10. Return Satellite to Nominal State
-```
-
-Expected recovery time:
-
-```text
-< 90 Seconds
-```
-
----
-
-# Hardware
-
-## Raspberry Pi 4 #1
-
-Runs:
-
-* FastAPI Server
-* Satellite Emulator
-* Transformer Classifier
-* Isolation Forest
-* LangGraph Recovery Agent
-* Command Signing Service
-
-## Raspberry Pi 4 #2
-
-Runs:
-
-* RTL-SDR Receiver
-* NOAA 137 MHz Monitoring
-* RF Spectrum Visualization
-
----
-
-# Technology Stack
-
-### Backend
-
-* Python
-* FastAPI
-* LangGraph
-* Uvicorn
-
-### Machine Learning
-
-* PyTorch
-* Scikit-Learn
-* Isolation Forest
-* Transformer Encoder
-
-### Space Technologies
-
-* SatNOGS
-* N2YO
-* TLE Analysis
-* Orbit Prediction
-
-### Security
-
-* CRYSTALS-Dilithium
-* Post-Quantum Cryptography
-* Secure Command Signing
-
----
-
-# Team
-
-| Member | Responsibility                                                 |
-| ------ | -------------------------------------------------------------- |
-| AI-1   | Anomaly Detection & Transformer Fault Classification           |
-| AI-2   | Satellite Emulator, FastAPI Backend & LangGraph Recovery Agent |
-| FE-1   | React Dashboard Development                                    |
-| FE-2   | Frontend Integration & API Connectivity                        |
-| CY-1   | Post-Quantum Security & Command Signing                        |
-
----
-
-# Innovation Highlights
-
-✅ Autonomous Satellite Recovery
-
-✅ Agentic AI Recovery Workflows
-
-✅ Satellite Digital Twin Emulator
-
-✅ Transformer-Based Fault Classification
-
-✅ TLE-Based Orbital Intelligence
-
-✅ Ground Contact Prediction
-
-✅ Post-Quantum Secure Uplink
-
-✅ Real-Time Telemetry Monitoring
-
-✅ Space + AI + Cybersecurity Integration
-
----
-
-# Future Work
-
-* Real CubeSat deployment
-* CCSDS packet support
-* SDR telemetry decoding
-* Multi-satellite constellation support
-* Reinforcement-learning recovery optimization
-* Autonomous mission planning
-
----
-
-# FAR AWAY 2026
-
-### Recovering Satellites in Seconds, Not Days.
-
-**Space × AI × Cybersecurity** 🚀🛰️🔐
+> **FAR AWAY 2026 — Recovering Satellites in Seconds, Not Days.**
+>
+> Space × AI × Cybersecurity 🚀🛰️🔐
