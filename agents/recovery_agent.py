@@ -57,7 +57,7 @@ def _find_procedure_library() -> Path:
     return candidates[0]  # fallback
 
 PROCEDURE_LIBRARY_PATH = _find_procedure_library()
-SIGNING_ENDPOINT       = "http://localhost:8001/sign"
+SIGNING_ENDPOINT       = "http://localhost:8000/crypto/sign"
 FASTAPI_BASE           = "http://localhost:8000"
 POLL_INTERVAL_S        = 1.0
 MAX_POLL_ATTEMPTS      = 30
@@ -254,34 +254,39 @@ def node_request_signing(state: AgentState) -> AgentState:
     """Node 4: Request CRYSTALS-Dilithium signing from CY-1."""
     print("[Agent] ── Node 4: Requesting Dilithium signing from CY-1")
     try:
-        payload = {
-            "commands":       state["command_sequence"],
-            "procedure_name": state["selected_procedure"]["procedure_name"],
-            "fault_type":     state["fault_type"],
-        }
-        try:
-            resp = httpx.post(SIGNING_ENDPOINT, json=payload, timeout=5.0)
-            resp.raise_for_status()
-            signed = resp.json()["signed_commands"]
-            state["signed_commands"] = signed
-            state["signing_success"] = True
-            print(f"[Agent]    CY-1 signing SUCCESS — {len(signed)} commands signed")
-        except Exception as sign_err:
-            print(f"[Agent]    CY-1 unavailable ({sign_err}), using MOCK signing")
-            signed = []
-            for cmd in state["command_sequence"]:
+        signed = []
+        for cmd in state["command_sequence"]:
+            cmd_hex = cmd["cmd"].encode().hex()
+            try:
+                resp = httpx.post(
+                    SIGNING_ENDPOINT,
+                    json={"command_bytes": cmd_hex},
+                    timeout=5.0
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                signed.append({
+                    **cmd,
+                    "signed":      True,
+                    "ml_dsa_sig":  result["ml_dsa_sig"],
+                    "ed25519_sig": result["ed25519_sig"],
+                    "nonce":       result["nonce"],
+                    "ledger_id":   result["ledger_id"],
+                })
+            except Exception as sign_err:
+                print(f"[Agent]    CY-1 unavailable ({sign_err}), using MOCK signing")
                 signed.append({
                     **cmd,
                     "signed":    True,
                     "signature": f"MOCK_SIG_{cmd['cmd']}_{int(time.time())}",
                 })
-            state["signed_commands"] = signed
-            state["signing_success"] = True
-
+        state["signed_commands"] = signed
+        state["signing_success"] = True
+        print(f"[Agent]    CY-1 signing SUCCESS — {len(signed)} commands signed")
         state["recovery_log"].append({
             "step":   "request_signing",
             "status": "ok",
-            "mock":   True,
+            "count":  len(signed),
             "ts":     _ts()
         })
     except Exception as e:

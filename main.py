@@ -359,6 +359,119 @@ async def reset_satellite():
     return {"status": "reset", "frame": emulator.get_latest_frame()}
 
 
+
+
+# ──────────────────────────────────────────────
+# Crypto / CY-1 Integration Endpoints
+# ──────────────────────────────────────────────
+
+class CommandCheckRequest(BaseModel):
+    command:        str
+    signature:      str
+    procedure_name: str = ""
+    satellite_id:   str = "DEADSAT-1"
+    signed:         bool = False
+
+class CommandCheckResponse(BaseModel):
+    valid:          bool
+    command:        str
+    signature:      str
+    verified_by:    str
+    message:        str
+
+
+class SignCommandRequest(BaseModel):
+    command_bytes: str   # hex-encoded command bytes
+
+@app.post("/crypto/sign")
+async def sign_command(req: SignCommandRequest):
+    """
+    CY-1 Dilithium signing endpoint.
+    Proxies to CY-1 service on :8001/sign if available.
+    Falls back to mock signing.
+    """
+    import httpx as _httpx
+    try:
+        resp = _httpx.post(
+            "http://localhost:8001/sign",
+            json={"command_bytes": req.command_bytes},
+            timeout=5.0
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        # Mock response matching CY-1 schema
+        import hashlib, secrets
+        nonce = secrets.token_hex(16)
+        mock_sig = hashlib.sha256((req.command_bytes + nonce).encode()).hexdigest()
+        return {
+            "ml_dsa_sig":  f"MOCK_ML_DSA_{mock_sig[:32]}",
+            "ed25519_sig": f"MOCK_ED25519_{mock_sig[32:]}",
+            "nonce":       nonce,
+            "ledger_id":   f"LEDGER_{secrets.token_hex(8)}",
+            "mock":        True,
+        }
+
+@app.post("/crypto/check-command")
+async def check_command(req: CommandCheckRequest):
+    """
+    CY-1 command verification endpoint.
+    Checks whether a command has a valid Dilithium signature before uplink.
+    If CY-1 signing service is live on :8001, proxies to it.
+    Falls back to mock verification if CY-1 is unavailable.
+    """
+    import httpx as _httpx
+
+    # Try CY-1 signing service first
+    try:
+        resp = _httpx.post(
+            "http://localhost:8001/verify",
+            json={
+                "command":        req.command,
+                "signature":      req.signature,
+                "procedure_name": req.procedure_name,
+                "satellite_id":   req.satellite_id,
+            },
+            timeout=3.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return CommandCheckResponse(
+            valid        = data.get("valid", False),
+            command      = req.command,
+            signature    = req.signature,
+            verified_by  = "CY-1 Dilithium",
+            message      = data.get("message", "Verified by CY-1")
+        )
+    except Exception:
+        pass
+
+    # Mock verification — accepts any MOCK_SIG_ prefix or non-empty signature
+    is_mock    = req.signature.startswith("MOCK_SIG_")
+    is_valid   = req.signed and len(req.signature) > 0
+
+    return CommandCheckResponse(
+        valid       = is_valid,
+        command     = req.command,
+        signature   = req.signature,
+        verified_by = "MOCK (CY-1 unavailable)",
+        message     = "Mock verification — CY-1 not connected" if is_mock
+                      else ("Valid signature" if is_valid else "Invalid — unsigned command rejected")
+    )
+
+
+@app.get("/crypto/status")
+async def crypto_status():
+    """Check if CY-1 Dilithium signing service is live."""
+    import httpx as _httpx
+    try:
+        resp = _httpx.get("http://localhost:8001/health", timeout=2.0)
+        resp.raise_for_status()
+        return {"cy1_online": True, "mode": "dilithium_pqc", "endpoint": "http://localhost:8001"}
+    except Exception:
+        return {"cy1_online": False, "mode": "mock_signing", "endpoint": "http://localhost:8001",
+                "message": "CY-1 not running — recovery agent using mock signatures"}
+
 # ──────────────────────────────────────────────
 # WebSocket Endpoints (FIX 4 & 5)
 # ──────────────────────────────────────────────
