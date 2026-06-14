@@ -506,7 +506,7 @@ See the [RF Ground Station](#-rf-ground-station) section — NOAA-18 going silen
 <sub>Emulator · LangGraph · Ground Contact</sub>
 </td>
 <td align="center" width="20%">
-<i>(add name)</i><br/>
+<i>Manthan Balani</i><br/>
 <sub>AI-1 — Fault Classifier</sub><br/>
 <sub>Transformer · Isolation Forest</sub>
 </td>
