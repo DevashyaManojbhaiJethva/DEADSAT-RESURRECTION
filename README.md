@@ -495,7 +495,6 @@ See the [RF Ground Station](#-rf-ground-station) section — NOAA-18 going silen
 <table>
 <tr>
 <td align="center" width="20%">
-<a href="https://github.com/DevashyaManojbhaiJethva"><img src="https://github.com/DevashyaManojbhaiJethva.png" width="80" alt="Devashya Jethva"/></a><br/>
 <b>Devashya Jethva</b><br/>
 <sub>CY-1 — Cyber Lead</sub><br/>
 <sub>Crypto · RTL-SDR · PCB · CAD · Team Lead</sub>
