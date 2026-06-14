@@ -532,6 +532,9 @@ See the [RF Ground Station](#-rf-ground-station) section — NOAA-18 going silen
 - 3D-printed **dual-bay enclosure** — "DeadSat Ground Station" unit housing both Pi 4s and the SDR dongle
 
 ---
+# Login credentials
+OPERATOR ID:  OP-AI2
+ACCESS KEY:   FAR-AWAY-2026
 
 ## License
 
