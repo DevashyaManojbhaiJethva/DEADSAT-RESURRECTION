@@ -2,533 +2,544 @@
 
 # 🛰️ DeadSat Resurrection
 
-### Autonomous Satellite Fault Detection, Classification, Recovery & Secure Command Uplink Platform
+### Autonomous Cyber-Forensic Recovery for Bricked Satellites
 
-**From bricked to nominal in under 90 seconds — fully autonomously.**
+**Far Away 2026 · India's Largest International Hackathon · Japan Grand Finale**
 
-![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
-![LangGraph](https://img.shields.io/badge/LangGraph-1.2.4-1C3C3C)
-![PQC](https://img.shields.io/badge/Security-CRYSTALS--Dilithium-critical)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Status](https://img.shields.io/badge/Status-Hackathon%20Prototype-orange)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![Raspberry Pi](https://img.shields.io/badge/Hardware-Raspberry%20Pi%204%20×2-C51A4A?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/)
+[![Post-Quantum](https://img.shields.io/badge/Crypto-Hybrid%20Ed25519%20%2B%20ML--DSA--65-6f42c1)](#-security-architecture)
+[![Status](https://img.shields.io/badge/Status-Round%201%20Complete-success)](#-roadmap)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
 
-**Built for FAR AWAY 2026 — Space & Aerospace × Agentic Systems × Cybersecurity**
+<sub>
+<img src="https://img.shields.io/github/stars/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION?style=social" alt="stars"/>
+<img src="https://img.shields.io/github/forks/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION?style=social" alt="forks"/>
+<img src="https://img.shields.io/github/last-commit/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION" alt="last commit"/>
+</sub>
 
 </div>
 
----
+<br/>
 
-## 📑 Table of Contents
-
-- [Overview](#-overview)
-- [Features](#-features)
-- [Architecture](#-architecture)
-- [Technical Stack](#-technical-stack)
-- [Machine Learning Pipeline](#-machine-learning-pipeline)
-- [Fault Taxonomy](#-fault-taxonomy)
-- [Repository Structure](#-repository-structure)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start)
-- [API Documentation](#-api-documentation)
-- [Demo](#-demo)
-- [Security](#-security)
-- [Performance](#-performance)
-- [Future Work](#-future-work)
-- [Contributors](#-contributors)
-- [License](#-license)
+> *When **NOAA-18** went dark mid-development, it became the exact scenario this project exists to solve. Had DeadSat Resurrection been watching, it would have diagnosed the fault, ruled out a cyberattack, and uplinked a cryptographically signed — and quantum-resistant — recovery command in under 90 seconds.*
 
 ---
 
-## 🌍 Overview
+## 📌 At a Glance
 
-### The Problem
+| | |
+|---|---|
+| ⏱️ **Recovery time** | < 90 seconds — vs. **48–96 hours** manual ground-ops |
+| 💰 **Cost of failure addressed** | ₹200–5,000 crore per bricked satellite |
+| 🧠 **Fault types diagnosed** | SEU · Software Bug · Firmware Corruption · Command Injection |
+| 🔐 **Signature schemes required** | **2** — Ed25519 *and* ML-DSA-65 (NIST FIPS 204), both must verify |
+| 🛰️ **Ledger integrity checks** | Every **10 seconds**, automatically, with live alerting |
+| 🖥️ **Ground station hardware** | 2 × Raspberry Pi 4 (4 GB) + RTL-SDR (RTL2832U) |
+| 📡 **Live satellite tracked** | Meteor-M2-4 @ 137.9 MHz, NORAD 59051 |
+| 🌍 **Telemetry baseline** | Seeded from real [SatNOGS](https://satnogs.org/) observations |
 
-When a satellite experiences an onboard fault — a bit-flip from a cosmic ray, a software crash loop, corrupted firmware, or a rogue command — recovery is a slow, manual, human-driven process. Engineers must:
+---
 
-1. Wait for a ground contact window
-2. Manually analyze downlinked telemetry
-3. Diagnose the fault type
-4. Draft and review a recovery procedure
-5. Wait for the next contact window
-6. Manually uplink and verify commands
+## Table of Contents
 
-This process typically takes **48–96 hours** per incident — even for well-understood fault classes.
+- [The Problem](#-the-problem)
+- [The Solution](#-the-solution)
+- [What Makes This Different](#-what-makes-this-different)
+- [Live System Proof](#-live-system-proof)
+- [System Architecture](#-system-architecture)
+- [Anatomy of a Recovery](#-anatomy-of-a-recovery)
+- [90-Second Demo Script](#-90-second-demo-script)
+- [Security Architecture](#-security-architecture)
+- [RF Ground Station](#-rf-ground-station)
+- [AI Layer](#-ai-layer)
+- [Frontend](#-frontend)
+- [Tech Stack](#-tech-stack)
+- [Project Structure](#-project-structure)
+- [Getting Started](#-getting-started)
+- [API Reference](#-api-reference)
+- [FAQ](#-faq)
+- [Roadmap](#-roadmap)
+- [Data Sources & Acknowledgments](#-data-sources--acknowledgments)
+- [Team](#-team)
+- [Hardware](#-hardware)
+- [License](#license)
 
-### The Solution
+---
 
-**DeadSat Resurrection** is an end-to-end autonomous pipeline that takes a satellite from **fault detected → fault classified → recovery planned → commands cryptographically signed → uplinked → verified nominal**, with no human in the loop.
+## 🛑 The Problem
 
-```
-Live Telemetry → Anomaly Detection → Fault Classification → Recovery Planning → Secure Uplink → Verified Nominal
-```
+Every year, **3–8 satellites go silent** due to recoverable faults — cosmic radiation flipping bits in memory (Single Event Upsets), software crashes, or deliberate command-injection attacks. Recovering them today means:
 
-### Impact
+- **48–96 hours** of manual ground-station debugging per incident
+- **No automated way** to tell a natural radiation fault apart from a cyberattack
+- **No open satellite command system** uses post-quantum cryptography — every uplink today is one sufficiently large quantum computer away from being forgeable
+- **₹200–5,000 crore** lost per satellite that never recovers
 
-| Metric | Traditional Recovery | DeadSat Resurrection |
+---
+
+## 🚀 The Solution
+
+DeadSat Resurrection is a fully autonomous, end-to-end recovery pipeline that **detects, diagnoses, signs, and uplinks a recovery command in under 90 seconds** — running on real ground-station hardware, not a slideshow.
+
+| Stage | What Happens |
+|---|---|
+| **1 · Detect** | A live satellite emulator streams telemetry every second. A Transformer + Isolation Forest model watches every frame in real time. |
+| **2 · Classify** | The model identifies the fault — `SEU`, `software_bug`, `firmware_corruption`, or `command_injection` — with subsystem, register, and confidence score. |
+| **3 · Recover** | A LangGraph agentic pipeline selects the matching recovery procedure, generates a command sequence, and **automatically retries with a fallback procedure if the first attempt fails**. |
+| **4 · Sign & Uplink** | Every command is signed with a **hybrid Ed25519 + post-quantum ML-DSA-65 (CRYSTALS-Dilithium3)** signature, permanently logged in a tamper-evident hash chain, and uplinked only after the satellite verifies both signatures. |
+
+---
+
+## 🏆 What Makes This Different
+
+Most hackathon "post-quantum crypto" projects call one library function and stop. This project goes further:
+
+- 🔐 **Hybrid signatures, not just PQC** — every command requires **both** a classical Ed25519 *and* an ML-DSA-65 (NIST FIPS 204) signature to verify. This mirrors the real migration strategy used by Cloudflare and Chrome today: if either algorithm is ever broken, the other still protects the command.
+- 🛡️ **Tamper-*detecting*, not just tamper-evident** — a background watchdog re-verifies the entire SHA-256 hash-chain ledger every 10 seconds and fires a live `CRITICAL` alert the moment any entry is altered — no manual audit required.
+- 🖥️ **Real dual-node hardware ground station** — two independent Raspberry Pi 4 units, one running the full AI + crypto stack, one dedicated to RF reception.
+- 📻 **Live satellite signal reception** — an RTL-SDR (RTL2832U) dongle on Pi #2 tracks a real operational weather satellite overhead, with live Doppler correction, SNR computation, and pass-quality grading.
+- 🌍 **Seeded from real spacecraft data** — the emulator's baseline telemetry is seeded from real SatNOGS observations, not arbitrary constants.
+
+#### How this compares
+
+| | Typical Hackathon "PQC" Project | DeadSat Resurrection |
 |---|---|---|
-| **Time to recovery** | 48–96 hours | **< 90 seconds** |
-| **Human involvement** | Manual, multi-team | Fully autonomous |
-| **Command authentication** | Manual review | Post-quantum signed (CRYSTALS-Dilithium) |
-| **Fault diagnosis** | Manual telemetry inspection | ML-driven (Isolation Forest + Transformer) |
+| Signature scheme | One PQC algorithm | **Hybrid** Ed25519 + ML-DSA-65 — both required |
+| Tamper detection | Manual / on request | **Continuous** 10-second watchdog with live alerts |
+| Replay protection | Often absent | Redis-backed one-time nonces, fails closed |
+| Hardware | Laptop demo | **Dual Raspberry Pi 4** ground station |
+| RF | None | **Live satellite tracking** with Doppler correction & SNR |
+| Telemetry baseline | Hardcoded constants | Seeded from **real SatNOGS** observations |
 
 ---
 
-## ✨ Features
+## 📟 Live System Proof
 
-- 🧠 **AI Fault Detection** — A Transformer-based classifier identifies the specific fault category (SEU, software bug, firmware corruption, command injection) from orbital and telemetry data.
-- 🔍 **Anomaly Detection** — An Isolation Forest model continuously monitors live telemetry and orbital parameters to flag deviations from nominal baselines in real time.
-- 🤖 **Autonomous Recovery** — A LangGraph-based agent plans, sequences, and executes multi-step recovery procedures with automatic fallback logic if a procedure fails.
-- 🔐 **Secure Command Uplink** — Every recovery command is digitally signed using **CRYSTALS-Dilithium**, a NIST-standardized post-quantum cryptographic algorithm, before transmission.
-- 📡 **Real-Time Telemetry** — Live telemetry frames are streamed to the operator dashboard at 1Hz over WebSockets, with full historical playback.
-- 🌐 **Orbital Intelligence** — Live orbital mechanics (TLE-based) drive ground contact window predictions and feed anomaly baselines for a 712-satellite reference catalog.
+This isn't a mockup — here's what actually prints on boot.
 
----
+**Pi #1 — Ground Station Compute:**
 
-## 🏗️ Architecture
+```text
+$ python3 main.py
+[CY-1] SYSTEM SELF-CHECK: ALL PASS
+       Hybrid keypair (Ed25519 + ML-DSA-65) ... OK
+       Sign / Verify loop .................... OK
+       Ledger write ........................... OK
+       Hash chain integrity .................. OK
 
-```mermaid
-graph TB
-    subgraph PI1["📦 Compute Node 1 — Core Platform"]
-        EMU["Satellite Emulator<br/>(OBC / ADCS / Power / Comms)"]
-        API["FastAPI Server<br/>REST + WebSocket"]
-        ML["AI-1: Isolation Forest<br/>+ Transformer Classifier"]
-        AGENT["AI-2: LangGraph<br/>Recovery Agent"]
-        SIGN["CY-1: PQC Command<br/>Signing Service<br/>(CRYSTALS-Dilithium)"]
-        DASH["FE-1: React<br/>Operator Dashboard"]
-
-        EMU <--> API
-        API <--> ML
-        ML -- "Fault Classification" --> AGENT
-        AGENT <--> API
-        AGENT --> SIGN
-        SIGN --> AGENT
-        API <--> DASH
-    end
-
-    subgraph PI2["📡 Compute Node 2 — RF Ground Station"]
-        SDR["RTL-SDR Receiver<br/>137 MHz NOAA Band"]
-    end
-
-    EXT["External Data Sources<br/>N2YO • SatNOGS • CelesTrak"]
-
-    EXT -.-> EMU
-    SDR -.->|"Live RF Telemetry"| PI1
+[CY-1] Ground Station Key Fingerprint: SHA256:a3f8b2c1...
+[WATCHDOG] Ledger integrity monitor started (10s interval)
+[EMULATOR] Digital twin initialized — baseline seeded from SatNOGS
+[API] FastAPI server running on http://0.0.0.0:8000
 ```
 
-**Pipeline summary:**
+**Pi #2 — RF Ground Station**, tracking a real pass over Ahmedabad:
 
-1. The **Satellite Emulator** generates realistic telemetry across four subsystems (OBC, ADCS, Power, Comms).
-2. **AI-1** continuously scores telemetry for anomalies and classifies confirmed faults.
-3. **AI-2's LangGraph agent** selects and executes a recovery procedure based on fault type and confidence.
-4. **CY-1's signing service** cryptographically signs every command before uplink.
-5. **FE-1's dashboard** visualizes telemetry, fault status, and recovery progress in real time.
-6. A secondary RF ground station independently receives live signals on the NOAA 137 MHz band.
-
----
-
-## ⚙️ Technical Stack
-
-### Backend
-| Component | Technology |
-|---|---|
-| API Framework | FastAPI + Uvicorn |
-| Language | Python 3.11 |
-| Agent Orchestration | LangGraph 1.2.4, LangChain Core 1.4.2 |
-| Real-time Transport | WebSocket + REST |
-
-### Machine Learning
-| Component | Technology |
-|---|---|
-| Framework | PyTorch, scikit-learn |
-| Anomaly Detection | Isolation Forest |
-| Fault Classification | Transformer Encoder (TLE-based) |
-| Training Data | 712-satellite catalog, 1,860+ training sequences |
-
-### Security
-| Component | Technology |
-|---|---|
-| Command Signing | CRYSTALS-Dilithium (liboqs) |
-| Standard | NIST Post-Quantum Cryptography (2024) |
-| Validation | Confidence-gated execution thresholds |
-
-### Orbital Mechanics
-| Component | Technology |
-|---|---|
-| Propagation | sgp4 2.23 |
-| Live Tracking | N2YO API |
-| Telemetry Reference | SatNOGS DB |
-| TLE Fallback | CelesTrak |
-
-### Frontend
-| Component | Technology |
-|---|---|
-| Framework | React |
-| Realtime Updates | WebSocket |
-| Data Layer | REST API |
-
----
-
-## 🧬 Machine Learning Pipeline
-
-```
-Live Telemetry → Isolation Forest → Transformer Encoder → Fault Classification → Recovery Agent
+```text
+$ python3 rf/spectrum_display.py
+[PREDICTOR] Meteor-M2-4 loaded — NORAD 59051 (source: celestrak.org)
+[PASS] Meteor-M2-4 — AOS: 2026-06-14 08:55:12 UTC | Max el: 30.7° | Duration: 9.2 min | Quality: GOOD
+[RTLSDR] Device opened — 137.900 MHz, gain=40
+[RTLSDR] Doppler — velocity=6.1 m/s shift=-2.8 Hz new_freq=137.9000 MHz
 ```
 
-### 1. Inputs
-
-The pipeline consumes two complementary data streams:
-
-- **Live telemetry frames** (1Hz): OBC status, ADCS rates/quaternion, power/battery state, comms link quality.
-- **Orbital elements (TLE-derived)**: `MEAN_MOTION`, `ECCENTRICITY`, `INCLINATION`, `RA_OF_ASC_NODE`, `ARG_OF_PERICENTER`, `MEAN_ANOMALY`, `BSTAR`, `MEAN_MOTION_DOT`, `REV_AT_EPOCH`.
-
-### 2. Feature Engineering
-
-From the raw orbital elements, the pipeline derives:
-
-- `ECC_DELTA` — deviation in orbital eccentricity from baseline
-- `REV_DELTA` — change in revolution count between epochs
-- `TLE_AGE_HOURS` — age of the most recent orbital element set
-- `BSTAR_ANOMALY` — deviation in drag coefficient
-- `MEAN_MOTION_ANOMALY` — deviation in mean motion from expected baseline
-
-### 3. Model Architecture
-
-- **Stage 1 — Isolation Forest**: An unsupervised ensemble model trained on nominal telemetry and orbital baselines for 712 reference satellites. Flags incoming frames whose feature vectors fall outside the learned "normal" envelope.
-- **Stage 2 — Transformer Encoder**: A sequence-based classifier that takes the derived orbital features and predicts one of four fault categories with an associated confidence score.
-
-### 4. Training Process
-
-- The model is trained on `training_baselines.csv`, an exported set of orbital and telemetry baselines covering 712 satellites.
-- Synthetic fault injection generates labeled sequences across all four fault categories (SEU, software bug, firmware corruption, command injection), producing 1,860+ training sequences.
-- Models are versioned (`V2`, `tle`) to track iterations as feature design evolved toward an orbital-mechanics-centric approach.
-
-### 5. Inference Process
-
-1. A new telemetry/orbital frame arrives.
-2. The Isolation Forest computes an anomaly score against the satellite's baseline.
-3. If anomalous, derived features are passed to the Transformer Encoder.
-4. The Transformer outputs a fault class and confidence score.
-5. If confidence meets the fault's minimum threshold, the result is forwarded to the **Recovery Agent**.
-
----
-
-## 🩺 Fault Taxonomy
-
-| Fault | Detection Method | Recovery |
-|---|---|---|
-| **SEU** (Single Event Upset) | `ECC_DELTA > 0.01` | `ADCS_MEMORY_SCRUB_v2` → fallback `OBC_SOFT_REBOOT_v1` |
-| **Software Bug** | `REV_DELTA ≤ 0` | `OBC_SOFT_REBOOT_v1` → fallback `OBC_HARD_RESET_v1` |
-| **Firmware Corruption** | Abnormal `BSTAR` or `MEAN_MOTION_DOT` | `FIRMWARE_ROLLBACK_v1` → fallback `SAFE_MODE_HOLD` |
-| **Command Injection** | `TLE_AGE_HOURS > 72` | `LOCKDOWN_REGEN_v1` → fallback `COMMS_HARD_RESET_v1` |
-
-> Each fault category has a **minimum confidence threshold** that must be met before a recovery procedure executes. Irreversible procedures (e.g., firmware rollback) require a higher threshold than reversible ones — see [Security](#-security).
-
----
-
-## 📁 Repository Structure
-
-```
-DEADSAT-RESURRECTION/
-├── agents/
-│   ├── recovery_agent.py            # LangGraph recovery pipeline
-│   └── procedure_library.json       # Fault → procedure → fallback mapping
-├── emulator/
-│   ├── satellite_emulator.py        # OBC/ADCS/Power/Comms state machine
-│   ├── contact_calculator.py        # Orbital mechanics & contact windows
-│   └── real_data_fetcher.py         # Live orbital data integration
-├── models/
-│   ├── satellite_fault_classifier.py
-│   ├── satellite_fault_classifier_V2.py
-│   └── satellite_fault_classifier_tle.py
-├── data/
-│   ├── input.csv                    # General satellite catalog
-│   ├── input__1_.csv                # CubeSat subset
-│   ├── input__2_.csv                # Amateur radio satellite subset
-│   └── training_baselines.csv       # ML training export
-├── docs/
-│   ├── deadsat_postman_collection.json
-│   ├── Satellite_Fault_Recovery_Design.docx
-│   └── CHANGES_V1_TO_V2.md
-├── main.py                           # FastAPI application entrypoint
-├── real_data_fetcher.py
-├── satellite_catalog.py              # Satellite catalog & TLE builder
-├── requirements.txt
-├── .env.example
-└── README.md
-```
-
----
-
-## 🔧 Installation
-
-### Prerequisites
-
-- Python 3.11+
-- `pip` and a virtual environment tool (recommended: `venv`)
-- (Optional) API credentials for live orbital data sources
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION.git
-cd DEADSAT-RESURRECTION
-```
-
-### 2. Install dependencies
-
-```bash
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### 3. Configure environment variables
-
-Copy the example environment file and fill in your own credentials:
-
-```bash
-cp .env.example .env
-```
-
-**`.env.example`**
-
-```env
-# --- External Orbital Data Providers (optional, for live data) ---
-N2YO_API_KEY=YOUR_API_KEY
-SATNOGS_TOKEN=YOUR_TOKEN
-
-# --- Target Satellite ---
-TARGET_NORAD=YOUR_NORAD_ID
-
-# --- Server Configuration ---
-APP_HOST=0.0.0.0
-APP_PORT=8000
-SIGNING_SERVICE_PORT=8001
-```
-
-> ⚠️ Never commit a real `.env` file. `.env` is excluded via `.gitignore`. If live data sources are unavailable, the system automatically falls back to the bundled local satellite catalog — no external credentials are required to run the demo.
-
----
-
-## 🚀 Quick Start
-
-```bash
-# 1. Activate your virtual environment
-source venv/bin/activate
-
-# 2. Start the FastAPI server (telemetry, recovery agent, signing service)
-python main.py
-
-# 3. Open the interactive API documentation
-#    http://localhost:8000/docs
-
-# 4. (Optional) Start the React dashboard
-cd frontend
-npm install
-npm start
-#    http://localhost:3000
-```
-
-Once running, the dashboard will display live telemetry, and you can trigger a simulated fault to watch the full detection → recovery → verification pipeline run end-to-end.
-
----
-
-## 📡 API Documentation
-
-All endpoints are served from the FastAPI application (`main.py`). Interactive Swagger documentation is available at `/docs` when the server is running.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/health` | Returns the current status of all four subsystems (OBC, ADCS, Power, Comms) |
-| `GET` | `/telemetry` | Returns the latest telemetry frame |
-| `GET` | `/telemetry/history` | Returns a sliding window of recent telemetry frames |
-| `GET` | `/contact` | Returns the next ground contact window for the target satellite |
-| `POST` | `/fault/inject` | Injects a simulated fault for demonstration and testing |
-| `POST` | `/recovery/trigger` | Initiates the autonomous recovery pipeline |
-| `POST` | `/reset` | Resets the satellite emulator to a nominal state |
-| `GET` | `/catalog/satellite/{norad_id}` | Returns orbital elements, TLE, and baseline data for a satellite |
-| `GET` | `/catalog/search` | Searches the satellite catalog by name |
-| `GET` | `/catalog/stats` | Returns summary statistics for the satellite catalog |
-| `GET` | `/catalog/baselines` | Returns baseline data used for anomaly model training |
-| `WS` | `/ws/telemetry` | Streams live telemetry frames to connected clients |
-| `WS` | `/ws/events` | Streams recovery pipeline status events to connected clients |
-
-### Example: Telemetry Frame Schema
+**A completed recovery run**, written to `recovery_logs/`:
 
 ```json
 {
-  "timestamp": 1718000000,
-  "frame_id": 42,
-  "obc_status": "nominal",
-  "obc_temp_c": 47.2,
-  "adcs_rate_deg_s": 0.003,
-  "adcs_pointing_err_deg": 0.001,
-  "adcs_status": "nominal",
-  "power_w": 82.4,
-  "battery_pct": 91.2,
-  "power_status": "nominal",
-  "comms_uplink": true,
-  "comms_downlink": true,
-  "signal_strength_dbm": -78.3,
-  "comms_status": "nominal",
-  "fault_injected": null
+  "fault_type": "SEU",
+  "subsystem": "ADCS",
+  "procedure": "ADCS_MEMORY_SCRUB_v2",
+  "signature_algorithms": ["Ed25519", "ML-DSA-65"],
+  "ledger_verified": true,
+  "success": true
 }
 ```
 
 ---
 
-## 🎬 Demo
+## 🏗️ System Architecture
 
-The full pipeline runs in under 90 seconds, from fault injection to verified recovery:
+```mermaid
+flowchart TB
+    subgraph DATA["📊 Data Sources"]
+        TLE[CelesTrak Live TLE]
+        SATNOGS[SatNOGS Telemetry]
+        RTLSDR[RTL-SDR RTL2832U]
+    end
+
+    subgraph PI1["🖥️ Raspberry Pi 4 #1 — Ground Station Compute"]
+        EMU["Satellite Emulator<br/>OBC · ADCS · Power · Comms"]
+        AI1["AI-1: Transformer + Isolation Forest<br/>Fault Classifier"]
+        AI2["AI-2: LangGraph Recovery Agent"]
+        CRYPTO["CY-1: Crypto Layer<br/>Hybrid Ed25519 + ML-DSA-65"]
+        API["FastAPI Backend"]
+    end
+
+    subgraph PI2["📡 Raspberry Pi 4 #2 — RF Ground Station"]
+        RFREAD["RTL-SDR Reader<br/>SNR · Doppler Correction"]
+        PREDICT["Meteor-M2-4 Pass Predictor"]
+        SPECTRUM["Live Spectrum Display"]
+    end
+
+    subgraph UI["💻 Operator Dashboard (React)"]
+        FE1["FE-1: Telemetry · 3D Orbit · Anomaly Feed"]
+        FE2["FE-2: Operator Panel · Crypto Verification"]
+    end
+
+    SATNOGS --> EMU
+    TLE --> AI2
+    EMU -->|telemetry stream| AI1
+    AI1 -->|fault report| AI2
+    AI2 -->|sign request| CRYPTO
+    CRYPTO -->|signed command| AI2
+    AI2 -->|verified uplink| EMU
+    CRYPTO -->|alerts + ledger| API
+    EMU --> API
+    AI1 --> API
+    API <--> FE1
+    API <--> FE2
+
+    RTLSDR --> RFREAD
+    RFREAD --> SPECTRUM
+    PREDICT --> SPECTRUM
+    SPECTRUM -.->|/rf/status| API
+```
+
+---
+
+## 🔁 Anatomy of a Recovery
+
+Every step below is a real network call between real services — nothing here is hardcoded into a single script.
 
 ```mermaid
 sequenceDiagram
-    participant Op as Operator
-    participant Sat as Satellite Emulator
-    participant AI1 as AI-1 (Detection)
-    participant Agent as Recovery Agent
-    participant Sign as CY-1 Signing
-    participant Sat2 as Satellite (Post-Recovery)
+    participant EMU as Satellite Emulator
+    participant AI1 as AI-1 (Classifier)
+    participant AI2 as AI-2 (Recovery Agent)
+    participant CY1 as CY-1 (Crypto Layer)
+    participant DASH as Dashboard
 
-    Op->>Sat: Inject fault (e.g. SEU)
-    Sat->>AI1: Telemetry stream shows anomaly
-    AI1->>AI1: Anomaly detected → fault classified
-    AI1->>Agent: Trigger recovery (with confidence score)
-    Agent->>Agent: Select procedure & generate commands
-    Agent->>Sign: Request command signing
-    Sign->>Agent: Return signed commands
-    Agent->>Sat2: Uplink signed commands
-    Sat2->>Agent: Recovery verified — status nominal
-    Agent->>Op: Recovery log saved
+    EMU->>AI1: telemetry frame (1 Hz)
+    Note over EMU,AI1: Fault injected (e.g. SEU)
+    AI1->>AI1: Transformer + Isolation Forest
+    AI1->>AI2: fault report (type, subsystem, confidence)
+    AI2->>AI2: select procedure from library
+    AI2->>CY1: POST /crypto/sign (command)
+    CY1->>CY1: sign with Ed25519 + ML-DSA-65
+    CY1->>CY1: write to hash-chain ledger
+    CY1->>AI2: signed command + nonce + TTL
+    AI2->>AI2: wait for ground-contact window
+    AI2->>EMU: uplink signed command
+    EMU->>CY1: POST /crypto/verify
+    CY1->>EMU: valid: true
+    EMU->>EMU: execute recovery procedure
+    EMU->>DASH: telemetry normalized ✅
+    CY1->>DASH: ledger entry + alert feed
 ```
 
-**Narrative walkthrough:**
+---
 
-1. **Dashboard loads** — all subsystems report nominal, live orbital position is displayed.
-2. **Fault injected** — e.g., a Single Event Upset is simulated on the ADCS subsystem.
-3. **Anomaly detected** — the Isolation Forest flags the deviation within seconds.
-4. **Fault classified** — the Transformer model confirms the fault type and confidence.
-5. **Recovery triggered** — the LangGraph agent selects the appropriate procedure.
-6. **Commands signed** — the recovery commands are cryptographically signed.
-7. **Commands uplinked** — signed commands are transmitted to the satellite.
-8. **Recovery verified** — telemetry confirms the subsystem has returned to nominal, and a recovery log is persisted for audit.
+## 🎬 90-Second Demo Script
+
+| Time | Step | What Happens |
+|---|---|---|
+| `0:00` | **Hardware intro** | Point to Pi #2 — live RF spectrum receiving Meteor-M2-4 in real time |
+| `0:15` | **Nominal** | Dashboard all green, telemetry flowing, Pi #1 terminal streaming live logs |
+| `0:25` | **Inject fault** | Operator injects an SEU — telemetry spikes red on screen |
+| `0:35` | **AI classifies** | Transformer + Isolation Forest diagnose the fault live, reasoning visible in the terminal |
+| `1:00` | **Diagnosis** | Fault type, subsystem, and confidence shown on the operator console |
+| `1:10` | **Sign** | AI-2 generates the recovery command; CY-1 signs it with hybrid Ed25519 + ML-DSA-65 |
+| `1:28` | **Uplink** | Signed command verified by the emulator and executed |
+| `1:35` | **Recovered** | Telemetry normalizes, dashboard turns green |
+| `1:45` | **Bonus: attack demo** | A rogue, unsigned command is injected — blocked and alerted in under 1 second |
 
 ---
 
-## 🔐 Security
+## 🔐 Security Architecture
 
-DeadSat Resurrection is designed with the assumption that **command authenticity is mission-critical** — an attacker who can inject unauthorized commands into a satellite's uplink poses a serious risk. The platform addresses this with several layers of protection.
+The crypto layer is the one part of DeadSat that is **not simulated** — every signature, hash, and database write below is real cryptography running on real hardware.
 
-### Post-Quantum Cryptography
-
-All recovery commands are signed using **CRYSTALS-Dilithium**, a digital signature scheme selected by NIST as a 2024 post-quantum cryptography standard. This ensures that command integrity and authenticity remain protected even against future quantum-capable adversaries.
-
-### Secure Command Signing
-
-Every command generated by the recovery agent passes through a dedicated signing service before uplink. Commands are signed as a batch, creating a verifiable record tied to the recovery run that produced them.
-
-### Recovery Validation
-
-Recovery procedures are gated by **confidence thresholds**:
-
-- Each fault type has a minimum classification confidence required before any recovery action is taken.
-- **Irreversible procedures** (such as a firmware rollback) require a substantially higher confidence threshold than reversible procedures (such as a memory scrub or soft reboot).
-- If the primary procedure does not resolve the fault, the agent automatically falls back to a secondary procedure — and ultimately to a safe-hold state if all options are exhausted.
-
-### Credential Management
-
-All third-party API credentials (orbital data providers) are loaded from environment variables and are never hardcoded or committed to the repository. The system is fully functional using a bundled local satellite catalog if external credentials are not configured.
-
-> For responsible disclosure of any security concerns, please open a private security advisory on this repository rather than a public issue.
-
----
-
-## 📊 Performance
-
-### API Test Suite Results
-
-Validated via an automated test runner across all public endpoints:
-
-| Metric | Result |
+| Module | Responsibility |
 |---|---|
-| Total Assertions | 78 |
-| Passed | 72 |
-| Failed | 6 |
-| **Pass Rate** | **92.3%** |
-| Average Response Time | 224 ms |
-| Total Suite Duration | 4.7 s |
+| `keygen.py` | Generates an Ed25519 keypair **and** an ML-DSA-65 (Dilithium3) keypair at startup. Private keys never touch disk. |
+| `sign.py` | Signs every recovery command with **both** algorithms and attaches a one-time nonce + TTL. |
+| `verify.py` | Rejects a command unless **both** signatures are valid **and** it is within its validity window. Expiry is checked first, before any expensive crypto. |
+| `ledger.py` | SQLite hash-chain — every signed command is permanently linked to the previous entry via SHA-256. |
+| `nonce.py` | Redis-backed one-time nonce store. Any replayed command is rejected instantly. |
+| `rogue_detector.py` | Fires a `CRITICAL` alert (red terminal output) for `UNSIGNED_COMMAND`, `SIGNATURE_MISMATCH`, `REPLAY_ATTACK`, or `LEDGER_TAMPERED`. |
+| Self-Test + Watchdog | On boot, runs a full sign → verify → ledger-write → chain-verify self-check — like a satellite power-on self-test. A background thread re-verifies the chain every 10 seconds. |
 
-### Recovery Pipeline Timing
+### Crypto API
 
-| Stage | Cumulative Time |
-|---|---|
-| Fault injected | T+05s |
-| Anomaly detected on live telemetry | T+15s |
-| Recovery agent triggered | T+20s |
-| Procedure selected | T+23s |
-| Commands generated | T+24s |
-| Commands signed (CRYSTALS-Dilithium) | T+25s |
-| Commands uplinked | T+27s |
-| Recovery verified — system nominal | **T+30s** |
-
----
-
-## 🛣️ Future Work
-
-- [ ] Real CubeSat hardware deployment
-- [ ] CCSDS packet protocol support
-- [ ] SDR-based telemetry decoding from live RF
-- [ ] Multi-satellite constellation support
-- [ ] Reinforcement-learning-based recovery optimization
-- [ ] Autonomous long-horizon mission planning
+| Endpoint | Method | Description |
+|---|---|---|
+| `/crypto/sign` | `POST` | Hybrid-sign a command, register its nonce, write it to the ledger. |
+| `/crypto/verify` | `POST` | Verify both signatures + TTL — the satellite's execution gate. |
+| `/crypto/check-command` | `POST` | Run the full rogue-command detector against a payload. |
+| `/crypto/ledger` | `GET` | Return the full tamper-evident command ledger. |
+| `/crypto/alerts` | `GET` | Return all rogue-command / integrity alerts. |
+| `/crypto/health` | `GET` | Self-test status, watchdog status, key fingerprint. |
+| `/crypto/metrics` | `GET` | Sign / verify counts, alert counts by type. |
 
 ---
 
-## 👥 Contributors
+## 📡 RF Ground Station
 
-| Role | Responsibility |
-|---|---|
-| **AI-1** | Anomaly detection (Isolation Forest) and fault classification (Transformer Encoder, TLE-based) |
-| **AI-2** | Satellite emulator, LangGraph recovery agent, FastAPI backend, orbital data integration |
-| **FE-1** | React dashboard and real-time telemetry visualization |
-| **FE-2** | Frontend–backend integration and API wiring |
-| **CY-1** | Post-quantum command signing service and recovery audit ledger |
+A second Raspberry Pi 4 runs an independent RF receive chain on an RTL-SDR (RTL2832U) dongle:
 
----
+- **`rtlsdr_reader.py`** — Opens the dongle, reads IQ samples, computes live SNR, applies real-time Doppler correction. Falls back to a realistic mock reader if no dongle is present.
+- **`meteor_predictor.py`** — Multi-source TLE resolver (CelesTrak → SatNOGS → N2YO → disk cache → emergency fallback) with on-disk caching. Calculates live AzEl position, range velocity, and grades upcoming passes (`EXCELLENT` / `GOOD` / `WEAK` / `SKIP`) for Ahmedabad (23.03°N, 72.58°E).
+- **`spectrum_display.py`** — Live waterfall spectrum on the Pi #2 monitor, with SNR, Doppler shift, pass quality, and time-to-next-pass overlaid. Exposes a `GET /rf/status` JSON endpoint on port `8002` so the main dashboard can show RF status too.
 
-## 📄 License
-
-This project is licensed under the **MIT License**.
-
-```
-MIT License
-
-Copyright (c) 2026 DeadSat Resurrection Team
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+```json
+GET /rf/status
+{
+  "satellite": "Meteor-M2-4",
+  "norad": 59051,
+  "frequency_mhz": 137.9,
+  "snr_db": 12.4,
+  "elevation_deg": 28.6,
+  "pass_quality": "GOOD",
+  "doppler_correction_hz": -2800,
+  "next_pass_eta_min": 0.0,
+  "receiving": true
+}
 ```
 
-See the [LICENSE](LICENSE) file for full details.
+> **Why Meteor-M2-4, not NOAA-18?** This project's emulator models a NOAA-18-class digital twin. During development, NOAA-18 itself went silent — the exact failure mode this project addresses. Live RF tracking was pointed at **Meteor-M2-4**, an operational weather satellite on the same VHF band, while the emulator continues to demonstrate how a fault on a satellite like NOAA-18 would be diagnosed and recovered.
 
 ---
+
+## 🤖 AI Layer
+
+**AI-1 — Forensic Fault Classifier**
+A Transformer Encoder (multi-head self-attention) runs alongside an Isolation Forest anomaly detector over a 60-second sliding window of 13 telemetry features — OBC temperature, error count, CPU/memory load, ADCS rate and pointing error, reaction-wheel speed, power draw, battery state, bus voltage, signal strength, and uplink/downlink status. Output: fault type, affected subsystem, register, confidence score, and an `is_attack` flag.
+
+**AI-2 — Recovery Agent & Satellite Emulator**
+A Python state-machine emulator models OBC, ADCS, Power, and Comms subsystems, seeded from real SatNOGS baselines, and supports four fault-injection modes. A LangGraph agent receives the fault report, selects a recovery procedure from `procedure_library.json`, requests a signed command from the crypto layer, schedules the uplink for the next ground-contact window (computed via SGP4 + live TLE), and **automatically falls back to an alternate procedure if the first attempt does not meet its success criteria**.
+
+---
+
+## 🖥️ Frontend
+
+| Component | Description |
+|---|---|
+| **FE-1 — Mission Dashboard** | Live telemetry charts (power, ADCS, OBC, comms), a 3D orbit visualization driven by live TLE data, and a real-time anomaly feed. |
+| **FE-2 — Operator Console** | Fault diagnosis panel, recovery plan + agent reasoning trace, one-click **AUTHORISE** uplink, fault-injection controls for live demos, and a crypto verification panel showing the ledger, key fingerprint, and rogue-command alerts. |
+
+---
+
+## 🛠️ Tech Stack
+
+| Layer | Technologies |
+|---|---|
+| Frontend | React 18, Vite, Recharts, Three.js / CesiumJS, WebSockets |
+| Backend | Python 3.11, FastAPI, Uvicorn, WebSockets |
+| AI / ML | PyTorch (Transformer Encoder), scikit-learn (Isolation Forest) |
+| Agentic Pipeline | LangGraph |
+| Cryptography | ML-DSA-65 (CRYSTALS-Dilithium3 / liboqs), Ed25519 (PyNaCl), Redis, SQLite |
+| Orbital Mechanics | SGP4, CelesTrak, ephem |
+| RF | pyrtlsdr, RTL2832U / R820T (RTL-SDR) |
+| Hardware | 2× Raspberry Pi 4 (4GB), RTL-SDR dongle, custom PCB hat (EasyEDA), 3D-printed enclosure |
+| Reliability | slowapi (rate limiting), structured logging, self-test + watchdog |
+
+---
+
+## 📂 Project Structure
+
+```text
+DEADSAT-RESURRECTION/
+├── main.py                      # FastAPI app — telemetry, fault injection, recovery trigger
+├── contact_calculator.py        # SGP4 ground-contact window calculator
+├── procedure_library.json       # Fault type → recovery procedure mapping
+│
+├── emulator/
+│   └── satellite_emulator.py    # OBC / ADCS / Power / Comms state machine + fault injection
+│
+├── agents/
+│   └── recovery_agent.py        # LangGraph recovery pipeline with fallback iteration
+│
+├── models/
+│   └── ...                      # AI-1 Transformer + Isolation Forest classifier
+│
+├── crypto/
+│   ├── keygen.py                # Hybrid Ed25519 + ML-DSA-65 keypair generation
+│   ├── sign.py                  # Hybrid signing + nonce + TTL
+│   ├── verify.py                # Hybrid verification gate
+│   ├── ledger.py                # SHA-256 hash-chain ledger + watchdog
+│   ├── nonce.py                 # Redis-backed replay protection
+│   ├── rogue_detector.py        # Rogue / replay / tamper alerting
+│   ├── crypto_routes.py         # FastAPI router — /crypto/*
+│   └── README.md
+│
+├── rf/
+│   ├── rtlsdr_reader.py         # RTL-SDR interface, SNR, Doppler correction
+│   ├── meteor_predictor.py      # Multi-source TLE + pass prediction
+│   └── spectrum_display.py      # Live spectrum UI + /rf/status API
+│
+├── frontend/
+│   ├── dashboard/                # FE-1 — telemetry, 3D orbit, anomaly feed
+│   └── operator/                 # FE-2 — operator console, crypto panel
+│
+├── recovery_logs/                # Timestamped logs of recovery runs
+├── data/                         # Training data for AI-1
+└── requirements.txt
+```
+
+---
+
+## ⚡ Getting Started
+
+### Pi #1 — Ground Station Compute
+
+```bash
+sudo apt update && sudo apt install -y python3-pip python3-dev cmake git build-essential redis-server
+sudo systemctl enable --now redis-server
+
+pip3 install -r requirements.txt
+python3 main.py
+```
+
+The FastAPI server starts on `http://0.0.0.0:8000`, running the emulator, AI-1 classifier, AI-2 recovery agent, and the full crypto layer (self-test + watchdog start automatically).
+
+### Pi #2 — RF Ground Station
+
+```bash
+sudo apt update && sudo apt install -y rtl-sdr librtlsdr-dev
+echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/blacklist-rtl.conf
+sudo modprobe -r dvb_usb_rtl28xxu
+
+pip3 install pyrtlsdr ephem matplotlib numpy fastapi uvicorn requests
+python3 rf/spectrum_display.py
+```
+
+Runs a live spectrum display on the Pi #2 monitor and exposes `GET /rf/status` on port `8002`. If no RTL-SDR is detected, a realistic mock reader is used automatically.
+
+### Frontend
+
+```bash
+cd frontend/dashboard && npm install && npm run dev
+cd frontend/operator  && npm install && npm run dev
+```
+
+---
+
+## 🌐 API Reference
+
+### Recovery Pipeline
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/telemetry/history?n=60` | `GET` | Last *n* telemetry frames from the emulator's ring buffer. |
+| `/fault/inject` | `POST` | Inject `SEU`, `software_bug`, `firmware_corruption`, or `command_injection`. |
+| `/recovery/trigger` | `POST` | Hand off a fault report to the AI-2 recovery agent. |
+| `/ws/telemetry` | `WS` | Live telemetry stream for the dashboard. |
+| `/ws/events` | `WS` | Live recovery status + alert stream. |
+
+### Crypto Layer
+
+See [Security Architecture → Crypto API](#-security-architecture) above.
+
+### RF Layer
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/rf/status` | `GET` | Live SNR, Doppler shift, pass quality, ETA to next pass *(Pi #2, port 8002)*. |
+
+---
+
+## ❓ FAQ
+
+**Why hybrid Ed25519 + ML-DSA-65 instead of just a post-quantum algorithm?**
+Because that's how real systems are migrating *right now*. Cloudflare and Chrome both deploy hybrid classical + post-quantum key exchange in production TLS — if either algorithm is ever found to have a flaw, the other still protects the data. A command is only valid here if **both** signatures verify.
+
+**Is the telemetry real or simulated?**
+The emulator's baseline values — battery state, power draw, temperatures — are seeded from real SatNOGS observations. Faults are injected on top of that real baseline for repeatable demonstrations.
+
+**What happens if Redis goes down?**
+The nonce manager fails **closed** — signing and verification will not silently skip replay protection. The system is designed to refuse rather than degrade silently.
+
+**Could this run on real flight hardware?**
+The Raspberry Pi 4 was chosen for hackathon accessibility and to make the demo tangible. The crypto, AI, and agent stack are pure Python and portable to flight-qualified ARM SBCs used in CubeSat missions.
+
+**Why Meteor-M2-4 instead of NOAA-18?**
+See the [RF Ground Station](#-rf-ground-station) section — NOAA-18 going silent mid-project is the real-world version of the exact problem this system is built to solve.
+
+---
+
+## 🗺️ Roadmap
+
+- [x] **Round 1** — Working end-to-end prototype: dual-Pi hardware, hybrid PQC, live RF reception, agentic recovery
+- [ ] **Delhi Offline Round** — Fabricated PCB hat, 3D-printed enclosure, expanded fault-injection library
+- [ ] **Japan Grand Finale** — Multi-satellite constellation simulation, hardware-in-the-loop ground station
+- [ ] **Beyond** — Open-source release for the CubeSat operator and amateur ground-station community
+
+---
+
+## 📊 Data Sources & Acknowledgments
+
+- **[CelesTrak](https://celestrak.org/)** — live TLE orbital data
+- **[SatNOGS](https://network.satnogs.org/)** — real satellite telemetry for emulator seeding and TLE fallback
+- **ESA Anomaly Dataset** & **NASA SMAP/MSL (Telemanom)** — satellite anomaly pattern pre-training
+- **BIRDS CubeSat EPS Dataset** & **CuCD-ID (Mendeley)** — real power and OBC/comms telemetry for classifier training
+- **NIST FIPS 204** — ML-DSA (CRYSTALS-Dilithium) specification
+
+---
+
+## 👥 Team
+
+<table>
+<tr>
+<td align="center" width="20%">
+<a href="https://github.com/DevashyaManojbhaiJethva"><img src="https://github.com/DevashyaManojbhaiJethva.png" width="80" alt="Devashya Jethva"/></a><br/>
+<b>Devashya Jethva</b><br/>
+<sub>CY-1 — Cyber Lead</sub><br/>
+<sub>Crypto · RTL-SDR · PCB · CAD · Team Lead</sub>
+</td>
+<td align="center" width="20%">
+<b>Neil Banerjee</b><br/>
+<sub>AI-2 — Recovery Agent</sub><br/>
+<sub>Emulator · LangGraph · Ground Contact</sub>
+</td>
+<td align="center" width="20%">
+<i>(add name)</i><br/>
+<sub>AI-1 — Fault Classifier</sub><br/>
+<sub>Transformer · Isolation Forest</sub>
+</td>
+<td align="center" width="20%">
+<i>(add name)</i><br/>
+<sub>FE-1 — Mission Dashboard</sub><br/>
+<sub>Telemetry · 3D Orbit</sub>
+</td>
+<td align="center" width="20%">
+<i>(add name)</i><br/>
+<sub>FE-2 — Operator Console</sub><br/>
+<sub>Operator UI · Backend Integration</sub>
+</td>
+</tr>
+</table>
+
+---
+
+## 🔩 Hardware
+
+- 2× **Raspberry Pi 4 (4GB)** — ground-station compute node and RF reception node
+- **RTL-SDR RTL2832U** (R820T tuner) — live VHF satellite reception, 137 MHz band
+- Custom **Pi HAT PCB** (EasyEDA) — GPIO header, RTL-SDR USB routing, SMA antenna port
+- 3D-printed **dual-bay enclosure** — "DeadSat Ground Station" unit housing both Pi 4s and the SDR dongle
+
+---
+
+## License
+
+This project is released under the [MIT License](LICENSE).
 
 <div align="center">
 
-**FAR AWAY 2026 — Recovering Satellites in Seconds, Not Days.**
-
-🚀 Space × AI × Cybersecurity 🔐
+**Built in 6 days for Far Away 2026 🇮🇳 → 🇯🇵**
 
 </div>
