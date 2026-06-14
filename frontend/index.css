@@ -1,0 +1,132 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  /* Theme color palette specified by Bold Typography design document */
+  --color-void: #0D0D0D;
+  --color-deepspace: #050505;
+  --color-signal-green: #CCFF00;
+  --color-threat-red: #FF3B30;
+  --color-data-blue: #4fc3f7;
+  --color-quantum-purple: #B794F4;
+  --color-ghost-border: rgba(255, 255, 255, 0.08);
+
+  --color-primary-fixed-dim: #CCFF00;
+  --color-surface-dim: #131313;
+  --color-surface-container-low: #1A1A1A;
+  --color-surface-container: #222222;
+  --color-surface-container-highest: #333333;
+  --color-on-surface-variant: #D4D4D4;
+  --color-error: #FF8F8F;
+  --color-outline-variant: #444444;
+}
+
+/* Cyber-Aerospace Background Grid */
+.bg-grid {
+  background-size: 40px 40px;
+  background-image: 
+    linear-gradient(to right, rgba(204, 255, 0, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(204, 255, 0, 0.03) 1px, transparent 1px);
+}
+
+.bg-grid-dense {
+  background-size: 20px 20px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+}
+
+/* Luminous Glow Accents */
+.glow-primary {
+  box-shadow: 0 0 20px rgba(204, 255, 0, 0.25);
+}
+
+.glow-error {
+  box-shadow: 0 0 20px rgba(255, 59, 48, 0.25);
+}
+
+.glow-secondary {
+  box-shadow: 0 0 20px rgba(79, 195, 247, 0.25);
+}
+
+.glow-purple {
+  box-shadow: 0 0 20px rgba(183, 148, 244, 0.25);
+}
+
+/* Custom Octagonal Clipping paths */
+.clip-octagon {
+  clip-path: polygon(15% 0%, 85% 0%, 100% 15%, 100% 85%, 85% 100%, 15% 100%, 0% 85%, 0% 15%);
+}
+
+.clip-bracket-tl {
+  border-top: 2px solid #CCFF00;
+  border-left: 2px solid #CCFF00;
+}
+
+.clip-bracket-br {
+  border-bottom: 2px solid #CCFF00;
+  border-right: 2px solid #CCFF00;
+}
+
+/* Heartbeat SVG Uptime Animation */
+.heartbeat-path {
+  stroke-dasharray: 200;
+  stroke-dashoffset: 200;
+  animation: heartbeat-dash 3s linear infinite;
+}
+
+@keyframes heartbeat-dash {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Typewriter cursor blinking animation */
+.typewriter-cursor {
+  border-right: 2px solid #CCFF00;
+  animation: blink-caret 0.75s step-end infinite;
+}
+
+@keyframes blink-caret {
+  from, to { border-color: transparent }
+  50% { border-color: #CCFF00 }
+}
+
+/* Scanning scanline laser line visual */
+@keyframes scanline {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+
+.scanline-effect {
+  animation: scanline 6s linear infinite;
+}
+
+/* Waterfall flow animation placeholder */
+@keyframes waterfall-flow {
+  0% { background-position: 0 0; }
+  100% { background-position: 0 100%; }
+}
+
+.waterfall-slide {
+  animation: waterfall-flow 4s linear infinite;
+}
+
+/* Hidden scrollbars for high fidelity console layout */
+.tech-scrollbar::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.tech-scrollbar::-webkit-scrollbar-track {
+  background: rgba(18, 18, 18, 0.5);
+}
+.tech-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(204, 255, 0, 0.3);
+}
+.tech-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(204, 255, 0, 0.6);
+}
+

@@ -1,0 +1,8 @@
+{
+  "name": "DEADSAT-RESURRECTION",
+  "description": "An intelligence-grade tactical console for critical high-stakes post-quantum orbital recovery operations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
