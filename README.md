@@ -516,7 +516,7 @@ See the [RF Ground Station](#-rf-ground-station) section — NOAA-18 going silen
 <sub>Telemetry · 3D Orbit</sub>
 </td>
 <td align="center" width="20%">
-<i>(add name)</i><br/>
+<i>Suraj Bind </i><br/>
 <sub>FE-2 — Operator Console</sub><br/>
 <sub>Operator UI · Backend Integration</sub>
 </td>
