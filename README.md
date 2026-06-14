@@ -511,7 +511,7 @@ See the [RF Ground Station](#-rf-ground-station) section — NOAA-18 going silen
 <sub>Transformer · Isolation Forest</sub>
 </td>
 <td align="center" width="20%">
-<i>(add name)</i><br/>
+<i>Rajvardhansingh Chauhan </i><br/>
 <sub>FE-1 — Mission Dashboard</sub><br/>
 <sub>Telemetry · 3D Orbit</sub>
 </td>
