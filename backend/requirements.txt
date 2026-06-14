@@ -1,0 +1,24 @@
+# DeadSat Resurrection — AI-2 dependencies
+
+python-dotenv>=1.0.0
+
+# Core
+fastapi>=0.111.0
+uvicorn>=0.30.0
+httpx>=0.27.0
+pydantic>=2.7.0
+
+# LangGraph
+langgraph==1.2.4
+langchain-core==1.4.2
+
+# WebSocket
+websockets>=14,<16
+
+# Orbital mechanics
+sgp4>=2.23
+
+# Dev
+pytest>=8.0.0
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
