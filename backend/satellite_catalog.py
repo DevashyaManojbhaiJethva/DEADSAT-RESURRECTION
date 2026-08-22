@@ -197,6 +197,36 @@ class SatelliteCatalog:
                 return row
         return None
 
+    def search_by_name(self, name: str = "", limit: int = 20) -> list[dict]:
+        """
+        All satellites whose OBJECT_NAME contains `name` (case-insensitive).
+
+        Companion to get_by_name(), which returns only the first match. Added
+        because main.py's /catalog/search reached straight into the private
+        `_catalog` dict and `_loaded` flag and called load() by hand — the only
+        endpoint that bypassed this class's API, so any future change to the
+        internal storage would have broken it silently while every other
+        catalog route kept working.
+
+        An empty `name` matches everything, which is what /catalog/search
+        relies on to list the catalogue.
+        """
+        if not self._loaded:
+            self.load()
+        name_lower = name.lower()
+        results: list[dict] = []
+        for nid, row in self._catalog.items():
+            if name_lower in row["OBJECT_NAME"].lower():
+                results.append({
+                    "norad_id":    nid,
+                    "name":        row["OBJECT_NAME"].strip(),
+                    "inclination": row["INCLINATION"],
+                    "epoch":       row["EPOCH"],
+                })
+                if len(results) >= limit:
+                    break
+        return results
+
     def get_tle(self, norad_id: int) -> Optional[dict]:
         """
         Build TLE from GP data for a satellite.

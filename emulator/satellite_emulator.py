@@ -31,6 +31,65 @@ class FaultType(str, Enum):
 
 
 # ──────────────────────────────────────────────
+# Procedure applicability
+# ──────────────────────────────────────────────
+#
+# WIRING: which faults each recovery procedure can actually remedy.
+#
+# Built from agents/procedure_library.json — the same file the AI-2 agent
+# selects procedures from — so the emulator and the agent cannot disagree
+# about what a procedure is for. A second hardcoded copy would drift the first
+# time a procedure was added to the library.
+#
+# The fallback below is used only if the library cannot be read (it lives in a
+# sibling directory that main.py adds to sys.path, so an import-order change
+# should degrade rather than crash). It is the JSON's contents as of
+# 2026-08-15 and is checked against the library by test_units.py.
+
+_APPLICABILITY_FALLBACK: dict = {
+    "ADCS_MEMORY_SCRUB_v2": {FaultType.SEU},
+    "OBC_SOFT_REBOOT_v1":   {FaultType.SEU, FaultType.SOFTWARE_BUG},
+    "OBC_HARD_RESET_v1":    {FaultType.SOFTWARE_BUG},
+    "FIRMWARE_ROLLBACK_v1": {FaultType.FIRMWARE_CORRUPTION},
+    "SAFE_MODE_HOLD":       {FaultType.FIRMWARE_CORRUPTION},
+    "LOCKDOWN_REGEN_v1":    {FaultType.COMMAND_INJECTION},
+    "COMMS_HARD_RESET_v1":  {FaultType.COMMAND_INJECTION},
+}
+
+
+def _load_procedure_applicability() -> dict:
+    """Invert procedure_library.json: procedure_name -> {FaultType, ...}."""
+    import json
+    from pathlib import Path
+
+    lib = Path(__file__).resolve().parent.parent / "agents" / "procedure_library.json"
+    try:
+        procedures = json.loads(lib.read_text(encoding="utf-8"))["procedures"]
+    except Exception as exc:  # pragma: no cover - depends on deployment layout
+        print(f"[Emulator] procedure_library.json unreadable ({exc}) — "
+              f"using built-in applicability map")
+        return dict(_APPLICABILITY_FALLBACK)
+
+    mapping: dict = {}
+    for fault_key, spec in procedures.items():
+        try:
+            fault = FaultType(fault_key)
+        except ValueError:
+            print(f"[Emulator] procedure_library.json has unknown fault key "
+                  f"'{fault_key}' — ignored")
+            continue
+        for proc in spec.get("recovery_priority", []):
+            name = proc.get("procedure_name") if isinstance(proc, dict) else proc
+            if name:
+                mapping.setdefault(name, set()).add(fault)
+
+    return mapping or dict(_APPLICABILITY_FALLBACK)
+
+
+PROCEDURE_APPLICABILITY: dict = _load_procedure_applicability()
+
+
+# ──────────────────────────────────────────────
 # Subsystem State Dataclasses
 # ──────────────────────────────────────────────
 
@@ -69,6 +128,14 @@ class CommsState:
     signal_strength_dbm: float = -78.3
     last_cmd_timestamp: int    = 0
     status: str                = "nominal"
+    #: Low-rate health beacon. SAFE_MODE_HOLD's only success criterion is
+    #: `beacon_active: true`, and the emulator never emitted this field — so
+    #: _check_criteria() skipped it (its missing-key branch treated absent as
+    #: pass) and SAFE_MODE_HOLD always "succeeded" without proving anything.
+    #: Now that criteria fail closed on a missing key, the field must exist.
+    #: A real spacecraft keeps the beacon up in safe mode; that is the point
+    #: of safe mode.
+    beacon_active: bool        = True
 
 
 # ──────────────────────────────────────────────
@@ -76,6 +143,76 @@ class CommsState:
 # ──────────────────────────────────────────────
 
 RING_BUFFER_SIZE = 120   # store 2 minutes, AI-1 needs last 60 frames
+
+
+# ──────────────────────────────────────────────
+# Telemetry bounds
+# ──────────────────────────────────────────────
+#
+# WIRING: solar_output_w, bus_voltage_v and reaction_wheel_rpm were unbounded
+# random walks — only battery_pct was clamped. Measured over 5000 ticks the
+# drift carried power_w to 192 W in one run and (as reported) 46.6 W in
+# another. Since LOCKDOWN_REGEN_v1's success criterion is `power_w > 75`, a
+# demo left running long enough failed on its own with no fault injected.
+#
+# Two bands per field:
+#
+#   NOMINAL_BANDS  — where a healthy satellite is held. Deliberately tight, and
+#                    the power floor sits above the 75 W criterion with margin
+#                    so nominal drift can never break a recovery check.
+#   PHYSICAL_LIMITS — hard survivable range. Used while a fault is active, so
+#                    fault effects can push telemetry far out of nominal
+#                    without becoming physically absurd, and so drift noise
+#                    cannot quietly undo a fault by clamping it back.
+#
+# Every field written by _update_nominal_drift() or _apply_fault_effects()
+# appears in PHYSICAL_LIMITS. test_units.py asserts that over 5000 ticks, in
+# every fault state, no frame value leaves these bounds.
+
+# Every band here that a success_criterion also constrains is deliberately
+# TIGHTER than that criterion, so nominal drift can never walk a recovered
+# satellite back across a threshold and fail a check that already passed.
+# The at-risk pairs (verified against procedure_library.json):
+#     adcs_rate_deg_s       "< 0.01"  -> band tops out at 0.009
+#     adcs_pointing_err_deg "< 0.01"  -> band tops out at 0.008
+#     obc_memory_pct        "< 60"    -> band tops out at 55
+#     obc_cpu_pct           "< 50"    -> band tops out at 40
+#     power_w               "> 75"    -> band floors at 78
+# test_units.py re-derives this check from the library, so adding a procedure
+# with a threshold inside a band fails the suite rather than the demo.
+NOMINAL_BANDS: dict = {
+    "obc_temp_c":            (35.0,  65.0),
+    "obc_cpu_pct":           (5.0,   40.0),
+    "obc_memory_pct":        (20.0,  55.0),
+    "adcs_rate_deg_s":       (0.0,   0.009),
+    "adcs_pointing_err_deg": (0.0,   0.008),
+    "adcs_wheel_rpm":        (4600.0, 5000.0),
+    "power_w":               (78.0,  90.0),   # floor > the 75 W criterion
+    "battery_pct":           (70.0,  100.0),
+    "bus_voltage_v":         (27.5,  28.6),
+    "signal_strength_dbm":   (-95.0, -60.0),
+}
+
+PHYSICAL_LIMITS: dict = {
+    "obc_temp_c":            (-40.0, 125.0),   # OBC survival range
+    "obc_cpu_pct":           (0.0,   100.0),
+    "obc_memory_pct":        (0.0,   100.0),
+    "obc_error_count":       (0,     9999),    # counter saturates, never grows forever
+    "adcs_rate_deg_s":       (0.0,   30.0),    # a tumbling spacecraft
+    "adcs_pointing_err_deg": (0.0,   180.0),   # cannot be more than fully inverted
+    "adcs_wheel_rpm":        (-6000.0, 6000.0),
+    "power_w":               (0.0,   120.0),
+    "battery_pct":           (0.0,   100.0),
+    "bus_voltage_v":         (18.0,  34.0),
+    "signal_strength_dbm":   (-130.0, -40.0),
+}
+
+
+def _clamp(value, bounds_key: str, faulted: bool):
+    """Clamp to the nominal band when healthy, to survivable limits when not."""
+    table = PHYSICAL_LIMITS if faulted else NOMINAL_BANDS
+    lo, hi = table.get(bounds_key) or PHYSICAL_LIMITS[bounds_key]
+    return max(lo, min(hi, value))
 
 
 # ──────────────────────────────────────────────
@@ -92,8 +229,9 @@ class SatelliteEmulator:
     Call apply_recovery() to restore nominal after agent uplinks fix.
     """
 
-    def __init__(self, tick_interval: float = 1.0):
+    def __init__(self, tick_interval: float = 1.0, norad_id: int = 28654):
         self.tick_interval  = tick_interval
+        self.norad_id       = norad_id          # PIPELINE: identifies which satellite is emulated
         self.obc            = OBCState()
         self.adcs           = ADCSState()
         self.power          = PowerState()
@@ -110,16 +248,34 @@ class SatelliteEmulator:
     # ── Lifecycle ──────────────────────────────
 
     def start(self):
-        """Start background tick thread."""
+        """
+        Start the background tick thread. Idempotent.
+
+        WIRING: this used to overwrite self._thread unconditionally. A second
+        start() left the first thread ticking with no reference to it, so
+        stop() could only ever join the most recent one — the orphan kept
+        mutating shared state and appending to the ring buffer forever.
+        Measured: two live threads after two start() calls, and the first still
+        running after stop().
+
+        This is reachable in practice: main.py constructs the emulator at module
+        scope and starts it in the lifespan handler, and `python main.py`
+        executes the module twice (once as __main__, once as "main" when uvicorn
+        imports it — see Prompt 5.2 A).
+        """
+        if self._running and self._thread and self._thread.is_alive():
+            print("[Emulator] Already running — start() ignored")
+            return
         self._running = True
         self._thread  = threading.Thread(target=self._tick_loop, daemon=True)
         self._thread.start()
-        print("[Emulator] Started — streaming telemetry every 1s")
+        print(f"[Emulator] Started — streaming telemetry every {self.tick_interval}s")
 
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=3)
+            self._thread = None
         print("[Emulator] Stopped")
 
     # ── Tick Loop ─────────────────────────────
@@ -135,38 +291,88 @@ class SatelliteEmulator:
             time.sleep(self.tick_interval)
 
     def _update_nominal_drift(self):
-        """Add small realistic noise to nominal telemetry each tick."""
-        if self.fault_injected in (None, FaultType.NONE):
-            self.obc.temp_c             += random.uniform(-0.3, 0.3)
-            self.obc.temp_c              = max(35.0, min(65.0, self.obc.temp_c))
-            self.obc.cpu_usage_pct      += random.uniform(-1.0, 1.0)
-            self.obc.cpu_usage_pct       = max(5.0, min(40.0, self.obc.cpu_usage_pct))
+        """
+        Add small realistic sensor noise to telemetry each tick.
 
-            self.adcs.rate_deg_s        += random.uniform(-0.001, 0.001)
-            self.adcs.rate_deg_s         = max(0.0, min(0.01, self.adcs.rate_deg_s))
-            self.adcs.reaction_wheel_rpm += random.uniform(-5, 5)
+        WIRING: this used to be wrapped in
 
-            self.power.solar_output_w   += random.uniform(-1.0, 1.0)
-            self.power.battery_pct      += random.uniform(-0.05, 0.1)
-            self.power.battery_pct       = max(70.0, min(100.0, self.power.battery_pct))
-            self.power.bus_voltage_v    += random.uniform(-0.05, 0.05)
+            if self.fault_injected in (None, FaultType.NONE):
 
-            self.comms.signal_strength_dbm += random.uniform(-1.0, 1.0)
-            self.comms.signal_strength_dbm  = max(-95.0, min(-60.0, self.comms.signal_strength_dbm))
+        so the moment any fault was injected EVERY subsystem froze — measured:
+        1 distinct obc_temp_c and 1 distinct signal_strength_dbm across 30
+        ticks. That directly contradicted the module's own "Improvement 2 —
+        fault state telemetry has noise on top of fault effects", and made
+        faulted telemetry trivially identifiable by its total absence of
+        sensor noise.
+
+        Noise now runs in every state. It cannot undo a fault, because while a
+        fault is active values are clamped to PHYSICAL_LIMITS rather than the
+        tight NOMINAL_BANDS, and _apply_fault_effects() runs immediately after
+        this and re-asserts the fault's own values. Drift amplitude is small
+        relative to every fault's per-tick effect.
+
+        Unbounded walks are also gone: solar_output_w, bus_voltage_v and
+        reaction_wheel_rpm are clamped like battery_pct always was.
+        """
+        faulted = self.fault_injected not in (None, FaultType.NONE)
+
+        self.obc.temp_c        = _clamp(self.obc.temp_c + random.uniform(-0.3, 0.3),
+                                        "obc_temp_c", faulted)
+        self.obc.cpu_usage_pct = _clamp(self.obc.cpu_usage_pct + random.uniform(-1.0, 1.0),
+                                        "obc_cpu_pct", faulted)
+        self.obc.memory_usage_pct = _clamp(
+            self.obc.memory_usage_pct + random.uniform(-0.5, 0.5),
+            "obc_memory_pct", faulted)
+
+        self.adcs.rate_deg_s = _clamp(self.adcs.rate_deg_s + random.uniform(-0.001, 0.001),
+                                      "adcs_rate_deg_s", faulted)
+        self.adcs.pointing_error_deg = _clamp(
+            self.adcs.pointing_error_deg + random.uniform(-0.0005, 0.0005),
+            "adcs_pointing_err_deg", faulted)
+        self.adcs.reaction_wheel_rpm = _clamp(
+            self.adcs.reaction_wheel_rpm + random.uniform(-5, 5),
+            "adcs_wheel_rpm", faulted)
+
+        self.power.solar_output_w = _clamp(
+            self.power.solar_output_w + random.uniform(-1.0, 1.0), "power_w", faulted)
+        self.power.battery_pct    = _clamp(
+            self.power.battery_pct + random.uniform(-0.05, 0.1), "battery_pct", faulted)
+        self.power.bus_voltage_v  = _clamp(
+            self.power.bus_voltage_v + random.uniform(-0.05, 0.05),
+            "bus_voltage_v", faulted)
+
+        self.comms.signal_strength_dbm = _clamp(
+            self.comms.signal_strength_dbm + random.uniform(-1.0, 1.0),
+            "signal_strength_dbm", faulted)
 
     def _apply_fault_effects(self):
-        """Progress fault symptoms each tick once a fault is active."""
+        """
+        Progress fault symptoms each tick once a fault is active.
+
+        WIRING: every additive effect below now saturates at a physical
+        ceiling. Previously they added to the same field on every tick with no
+        cap — measured for an SEU: adcs_rate_deg_s reached 15.4 deg/s after
+        150 ticks (nominal is < 0.01), pointing error 44.9 deg, and
+        obc_error_count grew without limit for as long as the process ran.
+        A fault is a condition to be recovered from, not an unbounded ramp.
+        """
         if self.fault_injected == FaultType.SEU:
-            self.adcs.rate_deg_s        += random.uniform(0.05, 0.15)
-            self.adcs.pointing_error_deg += random.uniform(0.1, 0.5)
+            self.adcs.rate_deg_s = _clamp(
+                self.adcs.rate_deg_s + random.uniform(0.05, 0.15),
+                "adcs_rate_deg_s", True)
+            self.adcs.pointing_error_deg = _clamp(
+                self.adcs.pointing_error_deg + random.uniform(0.1, 0.5),
+                "adcs_pointing_err_deg", True)
             self.adcs.status             = "fault"
-            self.obc.error_count        += 1
+            self.obc.error_count         = min(PHYSICAL_LIMITS["obc_error_count"][1],
+                                               self.obc.error_count + 1)
             self.obc.status              = "degraded"
 
         elif self.fault_injected == FaultType.SOFTWARE_BUG:
             self.obc.cpu_usage_pct      = min(100.0, self.obc.cpu_usage_pct + random.uniform(5, 15))
             self.obc.memory_usage_pct   = min(100.0, self.obc.memory_usage_pct + random.uniform(3, 8))
-            self.obc.error_count        += random.randint(1, 5)
+            self.obc.error_count        = min(PHYSICAL_LIMITS["obc_error_count"][1],
+                                              self.obc.error_count + random.randint(1, 5))
             self.obc.status              = "fault"
             self.comms.downlink_active   = False
             self.comms.status            = "degraded"
@@ -174,23 +380,33 @@ class SatelliteEmulator:
         elif self.fault_injected == FaultType.FIRMWARE_CORRUPTION:
             self.obc.status              = "fault"
             self.adcs.status             = "degraded"
-            self.power.bus_voltage_v    -= random.uniform(0.05, 0.2)
+            self.power.bus_voltage_v     = _clamp(
+                self.power.bus_voltage_v - random.uniform(0.05, 0.2),
+                "bus_voltage_v", True)
             self.power.status            = "degraded"
             self.comms.uplink_active     = False
             self.comms.downlink_active   = False
             self.comms.status            = "fault"
+            # A corrupted firmware image takes the beacon down with the rest of
+            # comms. Without this, beacon_active would be True for the whole run
+            # and SAFE_MODE_HOLD's only success criterion would pass trivially —
+            # as weak as the missing-key skip it replaces. SAFE_MODE_HOLD
+            # restores it, which is the point of safe mode.
+            self.comms.beacon_active     = False
 
         elif self.fault_injected == FaultType.COMMAND_INJECTION:
             self.comms.status            = "fault"
-            self.obc.error_count        += 1
-            self.power.solar_output_w   -= random.uniform(2, 5)
-            self.power.solar_output_w    = max(0.0, self.power.solar_output_w)
+            self.obc.error_count         = min(PHYSICAL_LIMITS["obc_error_count"][1],
+                                               self.obc.error_count + 1)
+            self.power.solar_output_w    = _clamp(
+                self.power.solar_output_w - random.uniform(2, 5), "power_w", True)
 
     def _build_frame(self) -> dict:
         """Build the canonical JSON telemetry frame shared with all team members."""
         return {
             "timestamp":             int(time.time()),
             "frame_id":              self._frame_count,
+            "norad_id":              self.norad_id,
 
             # OBC
             "obc_register":          self.obc.register,
@@ -219,6 +435,7 @@ class SatelliteEmulator:
             "comms_downlink":        self.comms.downlink_active,
             "signal_strength_dbm":   round(self.comms.signal_strength_dbm, 2),
             "comms_status":          self.comms.status,
+            "beacon_active":         self.comms.beacon_active,
 
             # Fault
             "fault_injected":        self.fault_injected.value if self.fault_injected else None,
@@ -302,15 +519,73 @@ class SatelliteEmulator:
             }
         print(f"[Emulator] FAULT INJECTED: Rogue Command → {payload}")
 
+    def inject_command_injection(self, payload: str = "ROGUE_CMD_0xDEAD"):
+        """
+        PIPELINE ALIAS for inject_command().
+
+        pipeline.py and the model-pipeline test suite name the four injectors
+        after the procedure_library.json keys:
+            SEU / software_bug / firmware_corruption / command_injection
+        This alias keeps that naming symmetric without breaking existing
+        callers of inject_command().
+        """
+        return self.inject_command(payload)
+
     # ── Recovery ──────────────────────────────
 
     def apply_recovery(self, procedure_name: str) -> bool:
         """
         Called by LangGraph agent after signed command uplinked.
         FIX 8: Added OBC_HARD_RESET_v1 and COMMS_HARD_RESET_v1 handlers.
+
+        WIRING: a procedure now only applies to the faults it can actually
+        remedy. This method used to end with an unconditional
+
+            self.fault_injected = FaultType.NONE
+            print("[Emulator] Recovery SUCCESS — satellite nominal")
+            return True
+
+        for ANY recognised procedure name. Reproduced: inject_SEU() then
+        apply_recovery("LOCKDOWN_REGEN_v1") — a comms lockdown, which touches
+        neither the OBC register nor the ADCS — returned True, printed
+        "Recovery SUCCESS", and cleared fault_injected while adcs_status was
+        still "fault".
+
+        That made the whole recovery loop untestable: any procedure "worked",
+        so success_criteria never had to be met, the fallback path could never
+        be reached, and a wrong diagnosis from AI-1 was indistinguishable from
+        a right one. The applicability check is what makes a wrong procedure
+        observable.
         """
         with self._lock:
             print(f"[Emulator] Applying recovery procedure: {procedure_name}")
+
+            # ── Applicability gate ────────────────────────────────────────
+            applicable = PROCEDURE_APPLICABILITY.get(procedure_name)
+            if applicable is None:
+                print(f"[Emulator] Unknown procedure: {procedure_name} — "
+                      f"no recovery applied")
+                return False
+
+            active = self.fault_injected
+            # fault_injected is Optional[FaultType] and is None on a fresh
+            # emulator, not FaultType.NONE — matching the existing check at
+            # _apply_fault_effects(). Testing only against FaultType.NONE let
+            # a healthy satellite fall through to the applicability branch and
+            # raise AttributeError on None.value, which would have surfaced as
+            # a 500 from /recovery/trigger.
+            if active in (None, FaultType.NONE):
+                # Nothing to fix. Applying a procedure to a healthy satellite
+                # is a no-op, not a success.
+                print(f"[Emulator] No active fault — {procedure_name} not applied")
+                return False
+
+            if active not in applicable:
+                print(f"[Emulator] {procedure_name} does not address "
+                      f"{active.value} (applies to: "
+                      f"{', '.join(f.value for f in applicable)}) — "
+                      f"REFUSED, state unchanged")
+                return False
 
             if procedure_name == "ADCS_MEMORY_SCRUB_v2":
                 self.adcs.rate_deg_s         = 0.003
@@ -343,8 +618,11 @@ class SatelliteEmulator:
                 self.comms.status           = "nominal"
 
             elif procedure_name == "SAFE_MODE_HOLD":
-                # Minimal safe mode — beacon active, wait for next contact
+                # Minimal safe mode — beacon active, wait for next contact.
+                # Restoring the beacon is what the procedure's success
+                # criterion (`beacon_active: true`) actually verifies.
                 self.obc.status             = "degraded"
+                self.comms.beacon_active    = True
                 print("[Emulator] Satellite in SAFE MODE HOLD — awaiting next contact")
 
             elif procedure_name == "LOCKDOWN_REGEN_v1":
@@ -359,12 +637,18 @@ class SatelliteEmulator:
                 self.comms                  = CommsState()
 
             else:
-                print(f"[Emulator] Unknown procedure: {procedure_name} — no recovery applied")
+                # Unreachable: PROCEDURE_APPLICABILITY is keyed by the same
+                # names as the branches above, and an unknown name is rejected
+                # by the applicability gate. Kept as a guard so that adding a
+                # procedure to the map without a handler fails loudly.
+                print(f"[Emulator] {procedure_name} is in PROCEDURE_APPLICABILITY "
+                      f"but has no handler — no recovery applied")
                 return False
 
             self.fault_injected = FaultType.NONE
             self.fault_detail   = {}
-            print(f"[Emulator] Recovery SUCCESS — satellite nominal")
+            print(f"[Emulator] Recovery SUCCESS — {procedure_name} applied for "
+                  f"{active.value}")
             return True
 
     # ── Utility ───────────────────────────────

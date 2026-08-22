@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Terminal, Shield, Cpu, Warning, Check } from './Icons';
+// WIRING: every command below now queries the real backend.
+import { API_BASE, api } from '../api';
 
 interface CommandOutput {
   command: string;
@@ -10,15 +12,39 @@ interface CommandOutput {
 
 export default function OperatorPanel() {
   const [inputCommand, setInputCommand] = useState('');
-  const [history, setHistory] = useState<CommandOutput[]>([
-    {
-      command: "SYSTEM_BOOT_LOG",
-      output: "DEADSAT-RESURRECTION INTEGRITY DIAGNOSTIC v2.4_SECURE.\nUPLINK CHANNELS: CONNECTED.\nPQC AUTHENTICATION RINGS: ACTIVE.\nType HELP for full commands catalog.",
-      timestamp: new Date().toLocaleTimeString(),
-      status: 'info'
-    }
-  ]);
+  const [busy, setBusy] = useState(false);
+  const [history, setHistory] = useState<CommandOutput[]>([]);
   const consoleBottomRef = useRef<HTMLDivElement>(null);
+
+  // WIRING: the boot banner reports the real connection state instead of
+  // asserting "UPLINK CHANNELS: CONNECTED / PQC RINGS: ACTIVE" unconditionally.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const l: any = await api.links();
+        if (!alive) return;
+        const lines = Object.entries(l.links)
+          .map(([k, v]: [string, any]) => `  ${k.padEnd(18)} ${v.connected ? 'OK  ' : 'DOWN'}  ${v.detail}`)
+          .join('\n');
+        setHistory([{
+          command: 'SYSTEM_BOOT_LOG',
+          output: `DEADSAT-RESURRECTION — ground segment link check\nEndpoint: ${API_BASE}\n${lines}\n\nType HELP for the command directory.`,
+          timestamp: new Date().toLocaleTimeString(),
+          status: l.all_connected ? 'info' : 'error',
+        }]);
+      } catch (e: any) {
+        if (!alive) return;
+        setHistory([{
+          command: 'SYSTEM_BOOT_LOG',
+          output: `BACKEND UNREACHABLE at ${API_BASE}\n${e.message}\n\nCheck VITE_API_BASE and that the API is running.`,
+          timestamp: new Date().toLocaleTimeString(),
+          status: 'error',
+        }]);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     if (consoleBottomRef.current) {
@@ -26,70 +52,133 @@ export default function OperatorPanel() {
     }
   }, [history]);
 
-  const handleCommandSubmit = (e: React.FormEvent) => {
+  const push = (command: string, output: string, status: CommandOutput['status']) =>
+    setHistory(prev => [...prev, { command, output, timestamp: new Date().toLocaleTimeString(), status }]);
+
+  const handleCommandSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const cmd = inputCommand.trim();
-    if (!cmd) return;
-
-    let reply = '';
-    let stat: 'success' | 'error' | 'info' = 'success';
+    if (!cmd || busy) return;
     const lowerCmd = cmd.toLowerCase();
+    setInputCommand('');
+
+    if (lowerCmd === 'clear') { setHistory([]); return; }
 
     if (lowerCmd === 'help') {
-      reply = "AVAILABLE ORBITAL COMMANDS DIRECTORY:\n" +
-              "-----------------------------------------\n" +
-              "  HELP            - Displays this commands guide.\n" +
-              "  STABILIZE       - Sends attitude stabilization correction signals to ADCS coils.\n" +
-              "  PING            - Executes high-frequency Ku-band range ping test.\n" +
-              "  SECURITY_AUDIT  - Conducts full cryptographic integrity scan across active boot sectors.\n" +
-              "  INJECT_KEY_A3   - Injects fresh high-entropy lattice seeds to Dilithium buffers.\n" +
-              "  SYS_STATS       - Queries physical bus voltage, telemetry SNR ratios, and temperature.\n" +
-              "  CLEAR           - Clears terminal logs history.";
-      stat = 'info';
-    } else if (lowerCmd === 'stabilize') {
-      reply = "TRANSMITTING ROTATIONAL STABILIZATION COEF: [pitch_delta=0.00, yaw_delta=0.00]\n" +
-              "ADCS electromagnetic coils... INDUCTING...\n" +
-              "Gyroscopic drag variance stabilizer... LOCKED.\n" +
-              "ORBITAL STABILIZATION PROTOCOL: NOMINAL (Attitude Stabilized).";
-    } else if (lowerCmd === 'ping') {
-      reply = "PINGING SATELLITE (NORAD 44804) AT 9.68 GHz...\n" +
-              "Transmitting payload (8 bytes: 0x9A 0x4B 0xFF 0x12 0x34 0xEE 0x00 0xFF)...\n" +
-              "Telemetry return packet received in 42.18ms. SNR: 18.2 dB.\n" +
-              "LINK QUALITY: EXCELLENT.";
-    } else if (lowerCmd === 'security_audit') {
-      reply = "EXECUTING SATELLITE FIRMWARE INTEGRITY VERIFICATION SCAN...\n" +
-              "Boot loader sector signature check: CRYSTALS-Dilithium3 OK.\n" +
-              "Telemetry uplink encryption index: NOMINAL.\n" +
-              "No Shor threats detected on active channels. PQC security hardcode score: 100%.";
-    } else if (lowerCmd === 'inject_key_a3') {
-      reply = "GENERATING FRESH LATTICE ENTROPY MATRICES q10485761...\n" +
-              "Injecting keyspace bits... SUCCESS.\n" +
-              "Signing bootloader sector blocks...\n" +
-              "Quantum key updated. Signature hash: 0x7E..2B";
-    } else if (lowerCmd === 'sys_stats') {
-      reply = "BUS STATE QUERY RETURNED:\n" +
-              "  BUS_VOLTAGE: 118.42V (NOM).\n" +
-              "  PROPELLANT_RESERVE: 94.18% (STABLE).\n" +
-              "  SOLAR_ORIENTATION: NOMINAL CELL CHARGE.\n" +
-              "  THERMAL_METER: 291.15 K.";
-    } else if (lowerCmd === 'clear') {
-      setHistory([]);
-      setInputCommand('');
+      push(cmd,
+        'AVAILABLE COMMANDS (all query the live backend):\n' +
+        '-----------------------------------------------\n' +
+        '  HELP            - This directory.\n' +
+        '  STATUS          - Satellite health from /health.\n' +
+        '  SYS_STATS       - Full telemetry frame from /telemetry.\n' +
+        '  PING            - Measured round-trip to the API.\n' +
+        '  CONTACT         - Next ground-contact window from /contact.\n' +
+        '  LINKS           - Per-component connection state.\n' +
+        '  AI_STATUS       - AI-1 artifact state from /pipeline/status.\n' +
+        '  CLASSIFY        - Run AI-1 over the current window.\n' +
+        '  SECURITY_AUDIT  - CY-1 status, ledger depth, open alerts.\n' +
+        '  LEDGER          - Recent signed-command ledger entries.\n' +
+        '  RF              - RF ground station (Pi #2) status.\n' +
+        '  STABILIZE       - Recover via ADCS_MEMORY_SCRUB_v2 (real uplink).\n' +
+        '  RESET           - Reset the emulator to nominal.\n' +
+        '  CLEAR           - Clear this terminal.', 'info');
       return;
-    } else {
-      reply = `COMMAND REJECTED: '${cmd}' is unknown.\nType HELP for terminal operations directory.`;
-      stat = 'error';
     }
 
-    const newHistory: CommandOutput = {
-      command: cmd,
-      output: reply,
-      timestamp: new Date().toLocaleTimeString(),
-      status: stat
-    };
-
-    setHistory(prev => [...prev, newHistory]);
-    setInputCommand('');
+    setBusy(true);
+    try {
+      switch (lowerCmd) {
+        case 'status': {
+          const h: any = await api.health();
+          push(cmd, Object.entries(h).map(([k, v]) => `  ${k.padEnd(16)} ${v}`).join('\n'), 'success');
+          break;
+        }
+        case 'sys_stats': {
+          const f: any = await api.telemetry();
+          push(cmd,
+            'LIVE TELEMETRY FRAME:\n' +
+            `  BUS_VOLTAGE      ${f.bus_voltage_v} V\n` +
+            `  BATTERY          ${f.battery_pct} %\n` +
+            `  SOLAR_OUTPUT     ${f.power_w} W\n` +
+            `  OBC_TEMP         ${f.obc_temp_c} °C\n` +
+            `  OBC_CPU          ${f.obc_cpu_pct} %\n` +
+            `  ADCS_RATE        ${f.adcs_rate_deg_s} deg/s\n` +
+            `  SIGNAL           ${f.signal_strength_dbm} dBm\n` +
+            `  FAULT            ${f.fault_injected ?? 'none'}\n` +
+            `  FRAME_ID         ${f.frame_id}`, 'success');
+          break;
+        }
+        case 'ping': {
+          const t0 = performance.now();
+          const h: any = await api.health();
+          push(cmd, `PING ${API_BASE}\nReply in ${Math.round(performance.now() - t0)} ms — health: ${h.overall}`, 'success');
+          break;
+        }
+        case 'contact': {
+          const c: any = await api.contact();
+          push(cmd, JSON.stringify(c, null, 2), 'success');
+          break;
+        }
+        case 'links': {
+          const l: any = await api.links();
+          push(cmd, Object.entries(l.links)
+            .map(([k, v]: [string, any]) => `  ${k.padEnd(18)} ${v.connected ? 'OK  ' : 'DOWN'}  ${v.detail}`)
+            .join('\n'), l.all_connected ? 'success' : 'error');
+          break;
+        }
+        case 'ai_status': {
+          const p: any = await api.pipelineStatus();
+          push(cmd, `  artifacts_ready  ${p.artifacts_ready}\n  missing          ${(p.missing_artifacts || []).join(', ') || 'none'}\n  seq_len          ${p.seq_len}\n  features         ${p.feature_cols?.length}\n  ${p.hint ?? ''}`,
+            p.artifacts_ready ? 'success' : 'error');
+          break;
+        }
+        case 'classify': {
+          const r: any = await api.classify();
+          push(cmd, `  fault_type       ${r.fault_type}\n  raw_class        ${r.raw_fault_class}\n  confidence       ${(r.confidence * 100).toFixed(2)}%\n  anomaly_flag     ${r.anomaly_flag}\n  norad_id         ${r.norad_id}`, 'success');
+          break;
+        }
+        case 'security_audit': {
+          const [s, l, a]: any[] = await Promise.all([api.cryptoStatus(), api.cryptoLedger(), api.cryptoAlerts()]);
+          push(cmd,
+            `  CY-1             ${s.cy1_online ? 'ONLINE' : 'OFFLINE'}\n` +
+            `  mode             ${s.mode}\n` +
+            `  endpoint         ${s.endpoint}\n` +
+            `  ledger entries   ${(l.entries || []).length}\n` +
+            `  open alerts      ${(a.alerts || []).length}`,
+            s.cy1_online ? 'success' : 'error');
+          break;
+        }
+        case 'ledger': {
+          const l: any = await api.cryptoLedger();
+          const rows = (l.entries || []).slice(-10);
+          push(cmd, rows.length
+            ? rows.map((r: any) => `  #${r.id} ${r.timestamp} ${String(r.cmd_hash).slice(0, 16)}… op=${r.operator}`).join('\n')
+            : '  (ledger empty or CY-1 offline)', rows.length ? 'success' : 'error');
+          break;
+        }
+        case 'rf': {
+          const r: any = await api.rfStatus();
+          push(cmd, r.online ? JSON.stringify(r.data, null, 2) : `  RF station OFFLINE\n  ${r.source}\n  ${r.error ?? ''}`, r.online ? 'success' : 'error');
+          break;
+        }
+        case 'stabilize': {
+          const r: any = await api.triggerRecovery('SEU');
+          push(cmd, `RECOVERY REQUESTED — ${r.message ?? 'agent engaged'}\nWatch /ws/events for progress.`, 'success');
+          break;
+        }
+        case 'reset': {
+          await api.reset();
+          push(cmd, 'Emulator reset to nominal.', 'success');
+          break;
+        }
+        default:
+          push(cmd, `COMMAND REJECTED: '${cmd}' is unknown.\nType HELP for the directory.`, 'error');
+      }
+    } catch (err: any) {
+      push(cmd, `ERROR: ${err.message}`, 'error');
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (

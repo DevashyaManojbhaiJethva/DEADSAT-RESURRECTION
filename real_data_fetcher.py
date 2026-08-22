@@ -39,10 +39,13 @@ GS_LAT = 23.0225
 GS_LON = 72.5714
 GS_ALT = 53       # metres
 
-# Default satellites
-NOAA_18_ID   = 28654   # 137 MHz NOAA downlink — visible on RTL-SDR
-CARTOSAT3_ID = 44233   # ISRO — thematic match
-ISS_ID       = 25544   # always active
+# NOAA-18 decommissioned June 2025 — switched to Meteor-M2-3
+METEOR_M2_3_ID = 57166   # Meteor-M2-3 — Active ✅ 137.900 MHz LRPT
+METEOR_M2_4_ID = 59051   # Meteor-M2-4 — Active ✅ 137.900 MHz LRPT
+NOAA_18_ID     = 28654   # Decommissioned June 2025 ❌
+CARTOSAT3_ID   = 44233   # ISRO — thematic match
+ISS_ID         = 25544   # fallback — always has data
+DEFAULT_NORAD_ID = METEOR_M2_3_ID  # Primary 2026 target
 
 
 # ──────────────────────────────────────────────
@@ -266,15 +269,16 @@ class RealDataFetcher:
 
     # Hardcoded fallback TLE (NOAA-18)
     FALLBACK_TLE = {
-        "name":   "NOAA 18 (FALLBACK)",
-        "line1":  "1 28654U 05018A   26158.50000000  .00000057  00000-0  52000-4 0  9991",
-        "line2":  "2 28654  98.8820 217.4320 0013900  87.1200 273.1100 14.10120001 07823",
+        "name":   "METEOR-M2-3 (FALLBACK)",
+        "line1":  "1 57166U 23091A   26158.50000000  .00000020  00000-0  11435-4 0  9998",
+        "line2":  "2 57166  98.6420 220.1234 0001820  95.4321 264.7012 14.23651234 16789",
         "source": "fallback",
+        "note":   "NOAA-18 decommissioned June 2025 — using Meteor-M2-3 (137.900 MHz active)"
     }
 
     def __init__(self, n2yo_api_key: Optional[str] = None,
                  satnogs_token: Optional[str] = None,
-                 norad_id: int = NOAA_18_ID):
+                 norad_id: int = METEOR_M2_3_ID):
         self.norad_id  = norad_id
         self.n2yo      = N2YOClient(api_key=n2yo_api_key)
         self.satnogs   = SatNOGSClient(token=satnogs_token)
@@ -389,7 +393,7 @@ if __name__ == "__main__":
     fetcher = RealDataFetcher(
         n2yo_api_key=n2yo_key,
         satnogs_token=satnogs_tok,
-        norad_id=NOAA_18_ID,
+        norad_id=METEOR_M2_3_ID,
     )
 
     print("\n=== TLE (priority chain) ===")

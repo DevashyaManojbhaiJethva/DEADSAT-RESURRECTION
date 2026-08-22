@@ -1,3 +1,4 @@
+import mock_oqs_nacl
 import threading
 import time
 import logging
@@ -7,7 +8,7 @@ import hashlib
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -55,6 +56,14 @@ class VerifyRequest(BaseModel):
     ml_dsa_sig_hex:  str
     ed25519_sig_hex: str
     valid_until:     int
+    # BUG C: replay protection was applied at SIGNING time — sign() consumed
+    # the nonce and /verify never looked at it. That is the wrong side of the
+    # trust boundary: the signer is us, the verifier is the gate an attacker
+    # has to get past. Replaying a captured command never touched sign(), so
+    # the check never ran. The nonce is now consumed here.
+    # Optional in the schema so an old client gets an explicit
+    # MISSING_NONCE rejection rather than a 422 it cannot interpret.
+    nonce:           Optional[str] = None
 
 class CheckCommandRequest(BaseModel):
     command_hex:     str
@@ -121,11 +130,46 @@ def _ensure_init():
 
 # --- Endpoints ---
 
+def _mock_signing_allowed() -> bool:
+    """
+    DEADSAT_ALLOW_MOCK_SIGNING, read at call time.
+
+    config.ALLOW_MOCK_SIGNING already defines this flag and already defaults
+    off, but it was only honoured inside the recovery agent. It is now enforced
+    at the SIGNING ENDPOINT, which is where it belongs: an endpoint that hands
+    out unverifiable signatures is a problem regardless of which client asked.
+    """
+    return os.environ.get('DEADSAT_ALLOW_MOCK_SIGNING', '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
 @router.post('/sign')
 @limiter.limit('30/minute')
 def sign(req: SignRequest, request: Request):
     global _sign_count
     _ensure_init()
+
+    # SECURITY: refuse to issue a signature that cannot be verified.
+    #
+    # When mock_oqs_nacl is active the primitives are fakes whose verify()
+    # accepts any byte string containing b"MOCK". Signing with them produces a
+    # credential that looks real to every downstream consumer, gets written to
+    # the ledger, and is only caught at the verification gate — where it burns
+    # a recovery attempt and reports MOCK_SIGNATURE instead of the true cause.
+    # Fail here, loudly, with the reason.
+    if mock_oqs_nacl.is_mock_active() and not _mock_signing_allowed():
+        detail = {
+            'reason': 'SIGNING_UNAVAILABLE',
+            'message': (f'Refusing to sign: {mock_oqs_nacl.mock_detail()}. '
+                        f'Install liboqs/PyNaCl, or set '
+                        f'DEADSAT_ALLOW_MOCK_SIGNING=1 to accept signatures '
+                        f'that are NOT cryptographically valid.'),
+            'mock_crypto': True,
+            'crypto_backend': mock_oqs_nacl.mock_detail(),
+        }
+        logger.error('Signing refused — %s', detail['message'])
+        print(f'\033[91m[CRYPTO] SIGNING REFUSED — {mock_oqs_nacl.mock_detail()}\033[0m')
+        raise HTTPException(status_code=503, detail=detail)
 
     cmd_bytes = bytes.fromhex(req.command_bytes)
 
@@ -136,7 +180,12 @@ def sign(req: SignRequest, request: Request):
             _keypair['ed25519_signing_key']
         )
 
-        _nonce_manager.use_nonce(result['nonce'])
+        # BUG C: `_nonce_manager.use_nonce(result['nonce'])` used to run HERE,
+        # burning the nonce at signing time. Since we are the signer, that
+        # only ever rejected our own duplicate signing calls — a replayed
+        # command goes straight to /verify and never passes through here, so
+        # the check could not fire on the attack it exists to stop. The nonce
+        # is now consumed in /verify, which is the trust boundary.
 
         ledger_id = _ledger.add_entry(
             command_hex     = result['command'],
@@ -174,6 +223,32 @@ def verify(req: VerifyRequest, request: Request):
         _keypair['ed25519_verify_key'],
         req.valid_until
     )
+
+    # BUG C: replay protection, moved from sign() to the trust boundary.
+    #
+    # Only claim the nonce if the signatures themselves check out — otherwise
+    # an attacker could burn a legitimate nonce by submitting garbage under it
+    # and deny the real command its one use.
+    if result.get('valid'):
+        if not req.nonce:
+            result['valid'] = False
+            result['reason'] = 'MISSING_NONCE'
+            result['message'] = ('Signatures verified but no nonce supplied — '
+                                 'cannot rule out a replay, refusing.')
+            logger.warning('Verify rejected — no nonce supplied')
+        elif not _nonce_manager.use_nonce(req.nonce):
+            result['valid'] = False
+            result['reason'] = 'REPLAYED_NONCE'
+            result['message'] = ('Signatures are valid but this nonce has '
+                                 'already been used — replayed command.')
+            logger.warning('Verify rejected — replayed nonce %s', req.nonce[:16])
+        else:
+            result['nonce_ok'] = True
+            # Surface when replay protection is process-local rather than
+            # shared, so a multi-worker deployment cannot quietly believe it
+            # has protection it does not have.
+            if getattr(_nonce_manager, 'is_mock', False):
+                result['nonce_store'] = 'in-memory (NOT replay-safe across workers)'
 
     with _key_lock:
         _verify_count += 1
@@ -225,7 +300,7 @@ def get_alerts(request: Request):
     ]
 
 
-@router.post('/check-command')
+@router.post('/check-rogue')
 @limiter.limit('60/minute')
 def check_command(req: CheckCommandRequest, request: Request):
     _ensure_init()
@@ -248,11 +323,34 @@ def check_command(req: CheckCommandRequest, request: Request):
 def health():
     _ensure_init()
     uptime = int(time.time()) - _startup_time if _startup_time else 0
-    status = 'ok' if _self_test_ok else 'degraded'
-    print(f'\033[92m[CRYPTO] Health check — status={status} uptime={uptime}s\033[0m')
+
+    # WIRING: a shimmed signer must never present as a real one. When
+    # mock_oqs_nacl is active the self-test signs and verifies through the
+    # same fake primitives, so it always passes — status 'ok' here was
+    # therefore meaningless. Report 'mock' so /system/links, the Security
+    # Console and any operator reading this endpoint can see it.
+    mock_active = mock_oqs_nacl.is_mock_active()
+    if mock_active:
+        status = 'mock'
+    else:
+        status = 'ok' if _self_test_ok else 'degraded'
+
+    colour = '\033[93m' if mock_active else '\033[92m'
+    print(f'{colour}[CRYPTO] Health check — status={status} uptime={uptime}s'
+          f'{" — " + mock_oqs_nacl.mock_detail() if mock_active else ""}\033[0m')
+    # WIRING: NonceManager falls back to an in-memory dict when redis is
+    # missing or unreachable. It set self.is_mock and nothing ever read it,
+    # so replay protection could silently degrade to per-process-only —
+    # which is no protection at all across uvicorn workers. Report it.
+    nonce_mock = bool(getattr(_nonce_manager, 'is_mock', False))
+
     return {
         'status':           status,
         'self_test_passed': _self_test_ok,
+        'mock_crypto':      mock_active,
+        'crypto_backend':   mock_oqs_nacl.mock_detail(),
+        'nonce_store':      'in-memory (NOT replay-safe across workers)'
+                            if nonce_mock else 'redis',
         'uptime_seconds':   uptime,
         'key_fingerprint':  _keypair['key_fingerprint'] if _keypair else None
     }

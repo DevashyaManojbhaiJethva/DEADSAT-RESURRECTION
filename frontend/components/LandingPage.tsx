@@ -234,7 +234,7 @@ export default function LandingPage({ satState, onStartRecovery }: LandingPagePr
                   <div className="flex justify-between items-start border-b border-white/[0.05] pb-4 mb-4">
                     <div>
                       <h4 className="font-sans font-bold text-base text-white">Dynamic Asset Threat Overview</h4>
-                      <p className="text-[11px] text-[#A1A1AA] mt-1 font-sans">Enterprise link state analytics updated real-time over secure gRPC gateway.</p>
+                      <p className="text-[11px] text-[#A1A1AA] mt-1 font-sans">Link state polled from /system/links and streamed over authenticated WebSockets.</p>
                     </div>
                     <span className="text-xs font-mono bg-[#1C1C22] p-1.5 rounded text-[#D4D4D4]/80">
                       STATION: IND_HQ

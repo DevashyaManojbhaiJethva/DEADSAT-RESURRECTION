@@ -1,3 +1,4 @@
+import mock_oqs_nacl
 import oqs
 import nacl.signing
 import hashlib

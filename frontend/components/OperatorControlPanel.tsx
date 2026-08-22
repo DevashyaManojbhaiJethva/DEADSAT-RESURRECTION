@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { Shield, Radio, Activity, Cpu, Warning, Check } from './Icons';
+// WIRING: real backend calls. These buttons previously only mutated local
+// state and dispatched a CustomEvent for cosmetic chart spikes.
+import { api, UI_FAULT_TO_BACKEND, subscribeEvents, AgentEvent } from '../api';
 
 // TLE and other structures matching our design style
 interface FaultOption {
@@ -102,49 +105,97 @@ export default function OperatorControlPanel() {
 
   // Rogue alerts CY-1 feed
   const [rogueAlerts, setRogueAlerts] = useState<Array<{ id: string; time: string; msg: string; type: 'nominal' | 'alert' }>>([
-    { id: '1', time: '14:02:18', msg: 'CY-1 Rogue Detector: No unauthorized 9.68GHz carriers present.', type: 'nominal' },
-    { id: '2', time: '14:08:44', msg: 'CY-1: Telemetry envelope signatures verified with high-entropy lattice seed.', type: 'nominal' },
+    // Seeded EMPTY. These two entries were hardcoded with fixed timestamps
+    // ('14:02:18', '14:08:44') and asserted results CY-1 had not produced —
+    // "signatures verified with high-entropy lattice seed" appeared before any
+    // signature existed, and survived even when the crypto layer was mocked.
+    // Real alerts come from GET /crypto/alerts (rogue_detector.py).
   ]);
 
-  // Time stamp interval updates
+  // WIRING: countdown + real uptime. The classifier metrics that used to
+  // drift randomly here are now fetched from AI-1 below.
+  const [uptimeStart] = useState<number>(Date.now());
   useEffect(() => {
     const timer = setInterval(() => {
-      setCountdown(prev => {
-        if (prev <= 1) return 45;
-        return prev - 1;
-      });
+      setCountdown(prev => (prev <= 1 ? 45 : prev - 1));
 
-      // Fluctuate confusion accuracy subtly
-      setConfusionVals(prev => {
-        const dev = (Math.random() - 0.5) * 0.1;
-        return {
-          ...prev,
-          truePos: Number(Math.min(100, Math.max(90, prev.truePos + dev)).toFixed(1)),
-          accuracy: Number(Math.min(100, Math.max(95, prev.accuracy + dev / 2)).toFixed(1))
-        };
-      });
-
-      // Update uptime representation seconds
-      const now = new Date();
-      const s = now.getSeconds().toString().padStart(2, '0');
-      const m = now.getMinutes().toString().padStart(2, '0');
-      setSystemUptime(`04d : 12h : ${m}m : ${s}s`);
+      // Real session uptime rather than a hardcoded "04d : 12h".
+      const elapsed = Math.floor((Date.now() - uptimeStart) / 1000);
+      const d = Math.floor(elapsed / 86400);
+      const h = Math.floor((elapsed % 86400) / 3600);
+      const m = Math.floor((elapsed % 3600) / 60);
+      const s = elapsed % 60;
+      setSystemUptime(
+        `${String(d).padStart(2, '0')}d : ${String(h).padStart(2, '0')}h : ` +
+        `${String(m).padStart(2, '0')}m : ${String(s).padStart(2, '0')}s`,
+      );
     }, 1000);
-
     return () => clearInterval(timer);
+  }, [uptimeStart]);
+
+  // WIRING: classifier confidence comes from a real AI-1 inference pass.
+  // These figures previously random-walked between fixed bounds, which made
+  // the model look like it was performing regardless of whether it was
+  // even trained.
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const status: any = await api.pipelineStatus();
+        if (!alive) return;
+        if (!status.artifacts_ready) {
+          setConfusionVals(prev => ({ ...prev, truePos: 0, accuracy: 0 }));
+          setTraceLogs(prev => [`[ai-1] artifacts not trained — ${status.hint ?? ''}`, ...prev].slice(0, 8));
+          return;
+        }
+        const r: any = await api.classify();
+        if (!alive) return;
+        const pct = Number(((r.confidence ?? 0) * 100).toFixed(1));
+        setConfusionVals(prev => ({ ...prev, truePos: pct, accuracy: pct }));
+      } catch {
+        if (alive) setConfusionVals(prev => ({ ...prev, truePos: 0, accuracy: 0 }));
+      }
+    };
+    load();
+    const t = setInterval(load, 15000);
+    return () => { alive = false; clearInterval(t); };
   }, []);
 
-  const handleInjectFault = () => {
+  const handleInjectFault = async () => {
     setInjecting(true);
     setRecovered(false);
     const target = FAULT_DATABASE[selectedFault];
     setActiveDiagnostic(target);
 
+    // ── WIRING: inject into the real emulator on Pi #1 ────────────────
+    // The UI offers 5 faults, the emulator models 4 — see UI_FAULT_TO_BACKEND
+    // in api.ts for the mapping rationale.
+    const backendFault = UI_FAULT_TO_BACKEND[selectedFault];
+    try {
+      await api.injectFault(backendFault);
+      setTraceLogs(prev => [
+        `[backend] Fault '${backendFault}' injected into emulator — telemetry degrading.`,
+        ...prev,
+      ]);
+    } catch (err: any) {
+      setTraceLogs([
+        `[backend] INJECTION FAILED — ${err.message}`,
+        `[backend] Is the API reachable at ${(import.meta as any).env?.VITE_API_BASE ?? 'http://<host>:8000'} ?`,
+        `[backend] Falling back to local visualisation only.`,
+      ]);
+      setRogueAlerts(prev => [
+        { id: Date.now().toString(), time: new Date().toLocaleTimeString(), msg: `Backend unreachable: ${err.message}`, type: 'alert' },
+        ...prev.slice(0, 3),
+      ]);
+      setTimeout(() => setInjecting(false), 800);
+      return;
+    }
+
     // Dynamic traces updating based on fault option
     if (selectedFault === 'seu') {
       setTraceLogs([
         `[agent:ingest] Real-time LEO telemetry registered high ADCS torque spike.`,
-        `[agent:classify] Evaluating vector parameters: [pitch=${(3.5 + Math.random()).toFixed(2)} deg/s, yaw_delta=2.11].`,
+        `[agent:classify] Evaluating orbital-element window against AI-1 thresholds.`,
         `[agent:diagnose] Classified gyroscopic register bit flip. Slew control compromised.`,
         `[agent:security] Security integrity check nominal. No rogue access detected.`,
         `[agent:recovery] Recovery graph initialized. Ready for Dilithium secure command uplink sequence.`
@@ -211,46 +262,110 @@ export default function OperatorControlPanel() {
     }, 800);
   };
 
-  const handleAuthoriseUplink = () => {
+  // ── WIRING: real recovery run ──────────────────────────────────────
+  // Previously this was a 150 ms timer that always reached 100% and always
+  // declared success. It now triggers the AI-2 recovery agent on Pi #1 and
+  // reports whatever actually happened, driven by /ws/events.
+  const handleAuthoriseUplink = async () => {
     if (isUplinking) return;
     setIsUplinking(true);
     setUplinkProgress(0);
     setRecovered(false);
+    setUplinkMessage('REQUESTING SIGNED COMMAND SEQUENCE FROM CY-1...');
 
-    const steps = [
-      'MODULATING GROUND TRANSMITTER ENVELOPE (9.68 GHz)...',
-      'ENCRYPTING SECURE COMMAND LEDGER WITH CRYSTALS-DILITHIUM...',
-      'BROADCASTING HARDENED LATTICE SIGNATURES...',
-      'VERIFYING SATELLITE ACC-CMD HANDSHAKE PACKET...',
-      'STATE RETRIEVAL COMPLETE. SATELLITE CORE STABILIZED!'
-    ];
+    const backendFault = UI_FAULT_TO_BACKEND[selectedFault];
 
-    let currentStep = 0;
-    const interval = setInterval(() => {
-      setUplinkProgress(prev => {
-        if (prev >= 100) {
-          clearInterval(interval);
-          setIsUplinking(false);
-          setRecovered(true);
-          setTraceLogs(prevLogs => [
-            ...prevLogs,
-            '[agent:uplink] SUCCESS: Core convergence telemetry recovered. Stabilizer active.',
-            '[agent:telemetry] Normal telemetry streaming resumed. Mission nominal.'
-          ]);
-          return 100;
-        }
-        
-        // Progress incremental update
-        const nextProg = prev + 5;
-        const stepIdx = Math.floor((nextProg / 100) * steps.length);
-        if (stepIdx < steps.length && stepIdx !== currentStep) {
-          currentStep = stepIdx;
-          setUplinkMessage(steps[stepIdx]);
-        }
-        return nextProg;
-      });
-    }, 150);
+    try {
+      await api.runPipeline(backendFault);
+      setTraceLogs(prev => [
+        ...prev,
+        `[agent:uplink] Recovery pipeline started for '${backendFault}'. Awaiting agent events...`,
+      ]);
+      // Progress is advanced by the /ws/events subscription below; this only
+      // shows motion until the first real event lands.
+      setUplinkProgress(10);
+    } catch (err: any) {
+      setIsUplinking(false);
+      setUplinkProgress(0);
+      setUplinkMessage('');
+      setTraceLogs(prev => [
+        ...prev,
+        `[agent:uplink] FAILED to start recovery — ${err.message}`,
+      ]);
+      setRogueAlerts(prev => [
+        { id: Date.now().toString(), time: new Date().toLocaleTimeString(), msg: `Recovery request rejected: ${err.message}`, type: 'alert' },
+        ...prev.slice(0, 3),
+      ]);
+    }
   };
+
+  // ── WIRING: subscribe to real agent progress ───────────────────────
+  useEffect(() => {
+    const sock = subscribeEvents((e: AgentEvent) => {
+      const p = e.payload ?? {};
+
+      if (e.event === 'pipeline_started' || e.event === 'recovery_started') {
+        setUplinkMessage('AI-2 RECOVERY GRAPH ENGAGED — SELECTING PROCEDURE...');
+        setUplinkProgress(25);
+        setTraceLogs(prev => [...prev, `[agent:graph] Recovery started for ${p.fault_type}.`]);
+      }
+
+      if (e.event === 'uplink_sent') {
+        setUplinkMessage(`BROADCASTING SIGNED COMMANDS — ${p.procedure_name}`);
+        setUplinkProgress(65);
+        setTraceLogs(prev => [
+          ...prev,
+          `[agent:uplink] ${p.commands_count} signed commands transmitted for ${p.procedure_name}.`,
+        ]);
+      }
+
+      if (e.event === 'pipeline_complete' || e.event === 'recovery_complete') {
+        setUplinkProgress(100);
+        setIsUplinking(false);
+        setRecovered(Boolean(p.success));
+        setUplinkMessage(
+          p.success
+            ? `RECOVERED VIA ${p.procedure_used} — SATELLITE NOMINAL`
+            : `RECOVERY FAILED — ${p.error ?? 'all procedures exhausted'}`,
+        );
+
+        const lines: string[] = [];
+        if (p.classified_fault) {
+          const conf =
+            typeof p.classifier_confidence === 'number'
+              ? `${(p.classifier_confidence * 100).toFixed(1)}%`
+              : 'n/a';
+          lines.push(`[agent:classify] AI-1 -> ${p.classified_fault} @ ${conf} confidence.`);
+        }
+        lines.push(
+          p.success
+            ? `[agent:verify] Recovery VERIFIED via ${p.procedure_used} after ${p.attempts} attempt(s) in ${p.elapsed_s}s.`
+            : `[agent:verify] Recovery FAILED: ${p.error ?? 'criteria not met'}.`,
+        );
+        setTraceLogs(prev => [...prev, ...lines]);
+
+        setRogueAlerts(prev => [
+          {
+            id: Date.now().toString(),
+            time: new Date().toLocaleTimeString(),
+            msg: p.success
+              ? `CY-1: signed command chain accepted. Ledger entry recorded for ${p.procedure_used}.`
+              : `CY-1: recovery aborted — ${p.error ?? 'verification failed'}.`,
+            type: p.success ? 'nominal' : 'alert',
+          },
+          ...prev.slice(0, 3),
+        ]);
+      }
+
+      if (e.event === 'pipeline_failed') {
+        setIsUplinking(false);
+        setUplinkProgress(0);
+        setUplinkMessage(`PIPELINE ERROR — ${p.error}`);
+        setTraceLogs(prev => [...prev, `[agent:error] ${p.error}`]);
+      }
+    });
+    return () => sock.close();
+  }, []);
 
   return (
     <div className="flex-1 flex flex-col gap-6 font-sans text-[#D4D4D4] select-text">

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { ScreenType, TelemetryState, SystemLog, CopilotMessage, SatelliteState } from './types';
+import { useDeadsat } from './useDeadsat';
 import LandingPage from './components/LandingPage';
 import AuthScreen from './components/AuthScreen';
 import TelemetryConsole from './components/TelemetryConsole';
@@ -40,13 +41,21 @@ export default function App() {
     return () => clearInterval(clockTimer);
   }, []);
 
-  // System logs state
-  const [logs, setLogs] = useState<SystemLog[]>([
-    { id: '1', timestamp: '14:00:12', message: 'DSN Handshake OK — Uplink initialized', type: 'nominal', category: 'network' },
-    { id: '2', timestamp: '14:01:05', message: 'Crypto key exchange: CRYSTALS-Dilithium standby', type: 'info', category: 'security' },
-    { id: '3', timestamp: '14:02:10', message: 'ADCS Variance detected on Pitch Axis (+2.4° delta)', type: 'warning', category: 'attitude' },
-    { id: '4', timestamp: '14:02:40', message: 'DSN Packet echo return success: 42ms', type: 'nominal', category: 'network' }
-  ]);
+  // ── LIVE BACKEND CONNECTION ──────────────────────────────────────
+  // Everything below used to be driven by Math.random() on a timer. It now
+  // comes from Pi #1 over /ws/telemetry and /ws/events. `simulated` is true
+  // only while the backend is unreachable, and the header says so rather
+  // than presenting invented numbers as live telemetry.
+  const {
+    telemetry,
+    frame,
+    logs,
+    links,
+    connected,
+    simulated,
+    ping,
+    pushLog,
+  } = useDeadsat();
 
   // AI Copilot Messages state
   const [copilotMessages, setCopilotMessages] = useState<CopilotMessage[]>([
@@ -55,67 +64,33 @@ export default function App() {
     { id: '3', timestamp: '14:02:45', text: 'Warning: Attitude stabilization coils drawing high current.', type: 'alert' }
   ]);
 
-  // Simulated live fluctuating telemetry
-  const [telemetry, setTelemetry] = useState<TelemetryState>({
-    powerArray: 84.18,
-    adcsPitch: 2.41,
-    adcsYaw: -0.82,
-    adcsStability: 'NOMINAL',
-    commsBandwidth: 1.18,
-    obcCpu: 42,
-    obcMem: 18,
-    altitude: 402.18,
-    velocity: 7.672,
-    lat: 32.51,
-    lng: 122.36,
-    temperature: 291.15
-  });
-
-  // telemetry fluctuations interval
+  // Reflect the live satellite identity from the backend telemetry frame.
   useEffect(() => {
-    const timer = setInterval(() => {
-      setTelemetry(prev => {
-        const d_pitch = (Math.random() - 0.5) * 0.1;
-        const d_yaw = (Math.random() - 0.5) * 0.05;
-        const nextPitch = Number((prev.adcsPitch + d_pitch).toFixed(2));
-        const nextYaw = Number((prev.adcsYaw + d_yaw).toFixed(2));
+    if (!frame?.norad_id) return;
+    setSatState(prev =>
+      prev.noradId === String(frame.norad_id)
+        ? prev
+        : { ...prev, noradId: String(frame.norad_id) }
+    );
+  }, [frame?.norad_id]);
 
-        // Let stability trigger WARN if values fluctuate beyond bounds
-        const absoluteStability = Math.abs(nextPitch) > 2.5 || Math.abs(nextYaw) > 1.2 ? 'WARN' : 'NOMINAL';
+  // Surface real fault state from the emulator in the copilot feed.
+  useEffect(() => {
+    if (!frame?.fault_injected || frame.fault_injected === 'none') return;
+    setCopilotMessages(prev => {
+      const text = `Emulator reports active fault: ${frame.fault_injected}. Health: ${frame.overall_health ?? 'unknown'}.`;
+      if (prev[prev.length - 1]?.text === text) return prev;
+      return [...prev.slice(-19), {
+        id: `${Date.now()}`,
+        timestamp: new Date().toLocaleTimeString(),
+        text,
+        type: 'alert'
+      }];
+    });
+  }, [frame?.fault_injected, frame?.overall_health]);
 
-        return {
-          ...prev,
-          powerArray: Number(Math.min(Math.max(prev.powerArray + (Math.random() - 0.5) * 0.3, 80), 99).toFixed(2)),
-          adcsPitch: nextPitch,
-          adcsYaw: nextYaw,
-          adcsStability: absoluteStability,
-          commsBandwidth: Number(Math.min(Math.max(prev.commsBandwidth + (Math.random() - 0.5) * 0.05, 0.8), 2.1).toFixed(2)),
-          obcCpu: Math.min(Math.max(prev.obcCpu + Math.floor((Math.random() - 0.5) * 4), 30), 85),
-          obcMem: Math.min(Math.max(prev.obcMem + Math.floor((Math.random() - 0.5) * 2), 15), 45),
-          altitude: Number((prev.altitude + (Math.random() - 0.5) * 0.01).toFixed(3)),
-          velocity: Number((prev.velocity + (Math.random() - 0.5) * 0.001).toFixed(4)),
-          lat: Number(((prev.lat + 0.002) % 180).toFixed(4)),
-          lng: Number(((prev.lng + 0.005) % 360).toFixed(4)),
-          temperature: Number((prev.temperature + (Math.random() - 0.5) * 0.1).toFixed(2))
-        };
-      });
-    }, 1200);
-
-    return () => clearInterval(timer);
-  }, []);
-
-  // satellite ping signal handler
-  const handlePing = () => {
-    const timeStr = new Date().toLocaleTimeString();
-    setLogs(prev => [
-      ...prev,
-      { id: Date.now().toString(), timestamp: timeStr, message: 'PING SATELLITE... TRANS_OK in 42ms', type: 'nominal', category: 'network' }
-    ]);
-    setCopilotMessages(prev => [
-      ...prev,
-      { id: Date.now().toString(), timestamp: timeStr, text: 'Executing link ping. Roundtrip echo packet verification nominal.', type: 'success' }
-    ]);
-  };
+  // Real ping — measures actual round-trip to Pi #1 instead of printing "42ms".
+  const handlePing = () => { void ping(); };
 
   // Auth gate check success
   const handleAuthSuccess = (opId: string, protocol: 'dilithium' | 'rsa') => {
@@ -127,12 +102,15 @@ export default function App() {
       activeKeyType: protocol === 'dilithium' ? 'DILITHIUM' : 'RSA_VULNERABLE'
     }));
 
-    // Append authorized console log
+    // Append authorized console log (logs now live in the useDeadsat hook)
     const timeStr = new Date().toLocaleTimeString();
-    setLogs(prev => [
-      ...prev,
-      { id: Date.now().toString(), timestamp: timeStr, message: `ACCESS GRANTED. Operator ${opId} utilizing ${protocol.toUpperCase()}`, type: 'nominal', category: 'security' }
-    ]);
+    pushLog({
+      id: Date.now().toString(),
+      timestamp: timeStr,
+      message: `ACCESS GRANTED. Operator ${opId} utilizing ${protocol.toUpperCase()}`,
+      type: 'nominal',
+      category: 'security',
+    });
 
     setCopilotMessages(prev => [
       ...prev,
@@ -181,6 +159,35 @@ export default function App() {
 
             {/* Quick clock feeds */}
             <div className="flex items-center gap-6 font-mono text-xs">
+              {/* LIVE LINK STATUS — real WebSocket state, not decoration */}
+              <div
+                title={
+                  links
+                    ? Object.entries(links.links)
+                        .map(([k, v]) => `${k}: ${v.connected ? 'OK' : 'DOWN'} — ${v.detail}`)
+                        .join('\n')
+                    : 'Link status unavailable'
+                }
+                className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 border rounded-sm text-[10px] uppercase font-bold tracking-wider cursor-help ${
+                  connected
+                    ? 'border-signal-green/35 bg-signal-green/10 text-signal-green'
+                    : 'border-threat-red/35 bg-threat-red/10 text-threat-red'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    connected ? 'bg-signal-green animate-pulse' : 'bg-threat-red'
+                  }`}
+                ></span>
+                <span>{connected ? 'LIVE TM' : 'SIMULATED'}</span>
+                {links && (
+                  <span className="opacity-60 ml-1">
+                    {Object.values(links.links).filter((l) => l.connected).length}/
+                    {Object.keys(links.links).length}
+                  </span>
+                )}
+              </div>
+
               <div className="hidden sm:block text-signal-green tracking-widest animate-pulse font-bold">
                 GMT: {gmtClock || '14:02:45'} | T-00:15:30
               </div>
@@ -286,11 +293,15 @@ export default function App() {
 
               {/* Small branding footer tags */}
               <div className="mt-auto px-3 border-t border-white/10 pt-4 hidden md:block">
+                {/* Must match GROUND_STATION in emulator/contact_calculator.py —
+                    every AOS/LOS window on this dashboard is computed from those
+                    coordinates. This read "NEW DELHI_HQ / 28.61 / 77.20", which
+                    is not where the contact calculator thinks the antenna is. */}
                 <div className="font-mono text-[8px] text-[#D4D4D4]/40 uppercase leading-normal">
-                  STN_LOC: NEW DELHI_HQ
+                  STN_LOC: AHMEDABAD_HQ
                 </div>
                 <div className="font-mono text-[8px] text-[#D4D4D4]/40 uppercase mt-0.5">
-                  LAT: 28.61 / LNG: 77.20
+                  LAT: 23.02 / LNG: 72.57
                 </div>
               </div>
             </aside>

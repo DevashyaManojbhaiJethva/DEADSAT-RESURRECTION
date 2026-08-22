@@ -15,6 +15,37 @@ import { Radio, Warning, Activity, Cpu, Shield, Power } from './Icons';
 import EarthGlobe from './EarthGlobe';
 
 // TLE type structure
+// WIRING: every metric on this dashboard now comes from the backend.
+import {
+  API_BASE,
+  TelemetryFrame,
+  api,
+  subscribeEvents,
+  subscribeTelemetry,
+} from '../api';
+
+/** Map an emulator telemetry frame onto this dashboard's chart point. */
+function frameToPoint(f: TelemetryFrame): TelemetryDataPoint {
+  const faulted = Boolean(f.fault_injected && f.fault_injected !== 'none');
+  return {
+    time: new Date((f.timestamp ?? Date.now() / 1000) * 1000).toLocaleTimeString(),
+    batteryPct: Number((f.battery_pct ?? 0).toFixed(2)),
+    batteryVoltage: Number((f.bus_voltage_v ?? 0).toFixed(2)),
+    cpuTemp: Number((f.obc_temp_c ?? 0).toFixed(1)),
+    powerConsumption: Number((f.power_w ?? 0).toFixed(1)),
+    angularRate: Number((f.adcs_rate_deg_s ?? 0).toFixed(3)),
+    signalStrength: Number((f.signal_strength_dbm ?? 0).toFixed(1)),
+    isFaultSpike: faulted,
+  };
+}
+
+/** Emulator status strings -> this component's three-level status. */
+function mapStatus(s?: string): 'nominal' | 'warning' | 'fault' {
+  if (s === 'fault') return 'fault';
+  if (s === 'degraded') return 'warning';
+  return 'nominal';
+}
+
 interface TLEData {
   name: string;
   line1: string;
@@ -50,26 +81,29 @@ interface AnomalyAlert {
 }
 
 export default function SatelliteDashboard() {
+  // WIRING: TLE starts empty and is populated from the backend catalog
+  // (/contact -> satellite_catalog.build_tle_from_gp). It previously held a
+  // hardcoded CARTOSAT-3 element set with placeholder digits.
   const [tle, setTle] = useState<TLEData>({
-    name: 'CARTOSAT-3',
-    line1: '1 44804U 19081A   26164.12345678  .00000123  00000-0  12345-4 0  9991',
-    line2: '2 44804  97.9123 123.4567 0012345  45.1234 315.8765 14.82345678  12340',
-    inclination: 97.9123,
-    eccentricity: 0.0012345,
-    raan: 123.4567,
-    meanMotion: 14.82345678,
-    periodMins: 97.14,
-    epoch: '2026-06-13 (Parsed)',
+    name: '—',
+    line1: '',
+    line2: '',
+    inclination: 0,
+    eccentricity: 0,
+    raan: 0,
+    meanMotion: 0,
+    periodMins: 0,
+    epoch: 'awaiting backend',
   });
 
-  const [tleLoading, setTleLoading] = useState<boolean>(false);
-  const [tleLastFetched, setTleLastFetched] = useState<string>('Local Backup');
+  const [tleLoading, setTleLoading] = useState<boolean>(true);
+  const [tleLastFetched, setTleLastFetched] = useState<string>('connecting…');
 
   // Ground Contact Countdown details
-  const [countdownSecs, setCountdownSecs] = useState<number>(1122); // 18m 42s
+  const [countdownSecs, setCountdownSecs] = useState<number>(0);
   const [isRecovering, setIsRecovering] = useState<boolean>(false);
   const [activeFault, setActiveFault] = useState<string | null>(null);
-  const [wsConnected, setWsConnected] = useState<boolean>(true);
+  const [wsConnected, setWsConnected] = useState<boolean>(false);
 
   // Screen layout selection
   // screen1 = Main Projector, screen2 = Pi 1 Monitor, screen3 = Pi 2 Monitor
@@ -82,11 +116,14 @@ export default function SatelliteDashboard() {
   const [cryptoLogs, setCryptoLogs] = useState<string[]>([]);
   const [watchdogLogs, setWatchdogLogs] = useState<string[]>([]);
 
-  // Listen for custom operator events
+  // Listen for custom operator events.
+  // WIRING: these remain as an immediate local echo so the panel reacts the
+  // instant the operator clicks, but they no longer *define* state — the
+  // authoritative fault, statuses and metrics all arrive over /ws/telemetry
+  // and overwrite anything set here on the next frame.
   useEffect(() => {
     const handleFaultInjection = (e: any) => {
       const fault = e.detail?.fault || 'seu';
-      setActiveFault(fault);
 
       // Instantly push critical alerts to feed
       const timeStr = new Date().toLocaleTimeString();
@@ -144,7 +181,9 @@ export default function SatelliteDashboard() {
 
     const handleRecoveryComplete = () => {
       setIsRecovering(false);
-      setActiveFault(null);
+      // WIRING: activeFault is no longer cleared locally — the emulator's
+      // next telemetry frame decides whether the fault actually cleared.
+      // Clearing it here made every recovery look successful regardless.
       const timeStr = new Date().toLocaleTimeString();
 
       // Clear faults and push NOMINAL restore logs
@@ -160,11 +199,21 @@ export default function SatelliteDashboard() {
         ...feed.slice(0, 7)
       ]);
 
+      // These lines are written by the BROWSER, not received from Pi #1. They
+      // previously asserted things that had not happened and could not be
+      // observed from here: a "Crystals-Dilithium signature transmitted 200 OK"
+      // against `/api/recovery/trigger` (not a real route — it is
+      // `/recovery/trigger`), and "Verified response signature index key #52A4.
+      // Post-quantum protection active" with a live timestamp, which is
+      // indistinguishable from genuine crypto output.
+      //
+      // Real signing and verification results arrive on /ws/events and are
+      // rendered by the subscribeEvents handler below. Marked [ui] so the
+      // panes cannot be mistaken for backend confirmation.
       const logTime = new Date().toISOString();
-      setFastapiLogs(prev => [...prev, `[${logTime}] GET /api/recovery/trigger - Transmitted Crystals-Dilithium signature. 200 OK`].slice(-25));
-      setRecoveryLogs(prev => [...prev, `[${logTime}] [agent:uplink] SUCCESS: Satellite safe-mode code successfully cleared. Normal LEO path locked.`].slice(-25));
-      setCryptoLogs(prev => [...prev, `[${logTime}] CRYPTO: Verified response signature index key #52A4. Post-quantum protection active.`].slice(-25));
-      setWatchdogLogs(prev => [...prev, `[${logTime}] WATCHDOG: Normal state broadcast returned. Subsystems re-armed.`].slice(-25));
+      setFastapiLogs(prev => [...prev, `[${logTime}] [ui] recovery complete event received`].slice(-25));
+      setRecoveryLogs(prev => [...prev, `[${logTime}] [ui] recovery reported complete — see agent trace above for the authoritative steps`].slice(-25));
+      setWatchdogLogs(prev => [...prev, `[${logTime}] [ui] subsystem statuses re-read from telemetry`].slice(-25));
     };
 
     window.addEventListener('inject-satellite-fault', handleFaultInjection);
@@ -241,223 +290,267 @@ export default function SatelliteDashboard() {
   const waterfallCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const spectrumPhaseRef = useRef<number>(0);
 
-  // 1. Fetch live TLE from CelesTrak
-  const fetchTLE = async () => {
+  // WIRING: live RTL-SDR power spectrum from Pi #2, proxied via Pi #1.
+  const rfBinsRef = useRef<number[]>([]);
+  const [rfOnline, setRfOnline] = useState<boolean>(false);
+  const [rfMeta, setRfMeta] = useState<any>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const res: any = await api.rfSpectrum();
+        if (!alive) return;
+        const bins: number[] = res?.data?.bins ?? res?.data?.power_dbm ?? [];
+        rfBinsRef.current = Array.isArray(bins) ? bins : [];
+        setRfOnline(Boolean(res?.online) && rfBinsRef.current.length > 0);
+        setRfMeta(res?.data ?? null);
+      } catch {
+        if (!alive) return;
+        rfBinsRef.current = [];
+        setRfOnline(false);
+      }
+    };
+    poll();
+    const t = setInterval(poll, 1000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  // 1. WIRING: TLE + orbital elements from the backend catalog.
+  //
+  // This previously fetched CelesTrak directly from the browser for a
+  // hardcoded NORAD 44804 — a satellite unrelated to this project, on an
+  // endpoint that sends no CORS header, so the request fails in a browser
+  // and the panel silently kept its placeholder element set.
+  //
+  // /catalog/satellite/{norad} serves the real GP row for the satellite the
+  // emulator is actually modelling, with the TLE generated by
+  // satellite_catalog.build_tle_from_gp().
+  const fetchTLE = async (norad: number) => {
     setTleLoading(true);
     try {
-      const response = await fetch('https://celestrak.org/NORAD/elements/gp.php?CATNR=44804&FORMAT=TLE');
-      if (response.ok) {
-        const text = await response.text();
-        const lines = text.trim().split('\n');
-        if (lines.length >= 3) {
-          const name = lines[0].trim();
-          const line1 = lines[1].trim();
-          const line2 = lines[2].trim();
-
-          const inclination = parseFloat(line2.substring(8, 16));
-          const raan = parseFloat(line2.substring(17, 25));
-          const eccStr = '0.' + line2.substring(26, 33).trim();
-          const eccentricity = parseFloat(eccStr);
-          const meanMotion = parseFloat(line2.substring(52, 63));
-          const periodMins = 1440 / meanMotion;
-
-          setTle({
-            name,
-            line1,
-            line2,
-            inclination,
-            eccentricity,
-            raan,
-            meanMotion,
-            periodMins: parseFloat(periodMins.toFixed(2)),
-            epoch: new Date().toLocaleDateString(),
-          });
-          setTleLastFetched(new Date().toLocaleTimeString());
-        }
-      }
-    } catch (err) {
-      console.warn('CelesTrak TLE request fell back.', err);
+      const sat: any = await api.satellite(norad);
+      const el = sat.orbital_elements ?? {};
+      const mm = Number(el.mean_motion) || 0;
+      setTle({
+        name: sat.name ?? `NORAD ${norad}`,
+        line1: sat.tle?.line1 ?? '',
+        line2: sat.tle?.line2 ?? '',
+        inclination: Number(el.inclination_deg) || 0,
+        eccentricity: Number(el.eccentricity) || 0,
+        raan: Number(el.ra_of_asc_node) || 0,
+        meanMotion: mm,
+        periodMins: mm > 0 ? Number((1440 / mm).toFixed(2)) : 0,
+        epoch: sat.epoch ?? '—',
+      });
+      setSatAltitude(Number(sat.anomaly_baselines?.altitude_km_approx) || 0);
+      setVelocity(Number((Math.sqrt(398600.4418 / (6371 + (Number(sat.anomaly_baselines?.altitude_km_approx) || 400)))).toFixed(3)));
+      setTleLastFetched(`${new Date().toLocaleTimeString()} (catalog)`);
+    } catch (err: any) {
+      setTleLastFetched(`unavailable — ${err.message}`);
     } finally {
       setTleLoading(false);
     }
   };
 
+  // Refetch whenever the emulator reports a different satellite.
   useEffect(() => {
-    fetchTLE();
-    const tleTimer = setInterval(fetchTLE, 300000); // 5 mins refresh
-    return () => clearInterval(tleTimer);
+    let alive = true;
+    const load = async () => {
+      try {
+        const f: any = await api.telemetry();
+        if (alive && f?.norad_id) {
+          setOrbitalNumber(f.frame_id ?? 0);
+          await fetchTLE(f.norad_id);
+        }
+      } catch {
+        if (alive) setTleLastFetched('backend unreachable');
+        setTleLoading(false);
+      }
+    };
+    load();
+    const tleTimer = setInterval(load, 300000); // refresh every 5 min
+    return () => { alive = false; clearInterval(tleTimer); };
   }, []);
 
   // 2. Initialize history data for charts
+  // WIRING: seed the chart from the emulator's real ring buffer instead of
+  // fabricating 20 points. /telemetry/history returns the same window AI-1
+  // classifies over.
   useEffect(() => {
-    const initialPoints: TelemetryDataPoint[] = [];
-    const baseTime = Date.now() - 30000;
-    for (let i = 0; i < 20; i++) {
-      const timeStr = new Date(baseTime + i * 1500).toLocaleTimeString();
-      initialPoints.push({
-        time: timeStr,
-        batteryPct: 83.2 + i * 0.04,
-        batteryVoltage: 32.4 + (Math.random() - 0.5) * 0.2,
-        cpuTemp: 38.6 + (Math.random() - 0.5) * 0.1,
-        powerConsumption: 52.4 + (Math.random() - 0.5) * 1.5,
-        angularRate: 0.08 + (Math.random() - 0.5) * 0.01,
-        signalStrength: -90 + (Math.random() - 0.5) * 4,
-        isFaultSpike: false,
-      });
-    }
-    setHistoryData(initialPoints);
+    let alive = true;
+    api.history(20)
+      .then((res: any) => {
+        if (!alive) return;
+        const frames: TelemetryFrame[] = res?.frames ?? res ?? [];
+        if (Array.isArray(frames) && frames.length) {
+          setHistoryData(frames.map(frameToPoint));
+        }
+      })
+      .catch(() => { /* backend down — chart fills from the live stream */ });
+    return () => { alive = false; };
   }, []);
 
-  // Populating initial mock terminal logs for Screen 2
+  // WIRING: terminal panes start empty and fill from real backend state.
+  // They previously printed a fixed boot transcript, including a fake
+  // "WebSocket client ... handshaking authorized" line that was a string
+  // literal rather than an actual connection.
   useEffect(() => {
-    const bootTime = new Date().toISOString();
-    setFastapiLogs([
-      `[${bootTime}] INFO:     Starting uvicorn server at port 8000`,
-      `[${bootTime}] INFO:     FastAPI app loaded successfully. Mount: /ws/telemetry`,
-      `[${bootTime}] INFO:     WebSocket client OP-HQ_DELHI handshaking authorized...`,
-      `[${bootTime}] INFO:     WS Client connected on /ws/telemetry`
-    ]);
-    setClassifierLogs([
-      `[${bootTime}] INITIALIZED: LSTM Neural Classification Pipeline running (v4.1).`,
-      `[${bootTime}] FEEDREADER: Ingesting realtime telemetry blocks. Frame rate: 1.0Hz`
-    ]);
-    setRecoveryLogs([
-      `[${bootTime}] RECOVERY: Multi-agent LangGraph system active.`,
-      `[${bootTime}] RECOVERY: Listening for Crystals-Dilithium verification state...`
-    ]);
-    setCryptoLogs([
-      `[${bootTime}] SECURE BOARD init: Post-Quantum Cryptography board active.`,
-      `[${bootTime}] SECURE BOARD: Key loaded. SHA256: 7A:91:BC:12:F5:6E:9A:8B:4C:3D:2E:1F:0D:3C:2B:1A`
-    ]);
-    setWatchdogLogs([
-      `[${bootTime}] WATCHDOG: Thread started. Cycle delay: 1000ms. HEALTH: OK.`
-    ]);
-  }, []);
-
-  // 3. Main interactive simulation & telemetry logic (Ticks every 1s)
-  useEffect(() => {
-    if (!wsConnected) return;
-
-    const timer = setInterval(() => {
-      // Countdown Timer decrement
-      setCountdownSecs(prev => (prev <= 1 ? 1122 : prev - 1));
-
-      setHistoryData(prev => {
-        const nextTime = new Date().toLocaleTimeString();
-
-        // Check if there is an active fault state
-        const hasFault = activeFault !== null;
-
-        // Fluctuations
-        const normalBattery = prev[prev.length - 1]?.batteryPct || 84;
-        let batteryPct = normalBattery + (Math.random() * 0.04 - 0.01);
-        if (activeFault === 'battery_fail') batteryPct = Math.max(15, normalBattery - 0.85); // Critical discharge
-        if (batteryPct > 100) batteryPct = 100;
-
-        let batteryVoltage = 32.4 + (Math.random() - 0.5) * 0.15;
-        if (activeFault === 'battery_fail') batteryVoltage = 21.8 + (Math.random() - 0.5) * 0.2; // Huge voltage drop
-
-        let cpuTemp = 38.5 + (Math.random() - 0.5) * 0.15;
-        if (activeFault === 'leak') cpuTemp = 64.2 + (Math.random() - 0.5) * 0.4; // Extreme processor temperature
-
-        let powerConsumption = 52.4 + (Math.random() - 0.5) * 0.8;
-        if (activeFault === 'adcs_fail') powerConsumption = 118.5 + (Math.random() - 0.5) * 1.5; // High actuator coil current draw
-
-        let angularRate = 0.07 + (Math.random() - 0.5) * 0.005;
-        if (activeFault === 'seu') angularRate = 2.85 + (Math.random() - 0.5) * 0.1; // Cosmic ray rate drift
-        if (activeFault === 'adcs_fail') angularRate = 4.62 + (Math.random() - 0.5) * 0.15; // Hard saturated spin rate
-
-        const commsSignal = isInContact 
-          ? Number((-52.4 + (Math.random() - 0.5) * 2).toFixed(1)) 
-          : Number((-112.8 + (Math.random() - 0.5) * 1).toFixed(1));
-        let signalStrength = commsSignal;
-        if (activeFault === 'injection' && isInContact) {
-          signalStrength = -88.4 + (Math.random() - 0.5) * 6; // Flooded jamming transceiver range
-        }
-
-        const nextPoint: TelemetryDataPoint = {
-          time: nextTime,
-          batteryPct: Number(batteryPct.toFixed(2)),
-          batteryVoltage: Number(batteryVoltage.toFixed(2)),
-          cpuTemp: Number(cpuTemp.toFixed(1)),
-          powerConsumption: Number(powerConsumption.toFixed(1)),
-          angularRate: Number(angularRate.toFixed(3)),
-          signalStrength: Number(signalStrength.toFixed(1)),
-          isFaultSpike: hasFault,
-        };
-
-        // Manage critical status flags based on telemetry thresholds
-        setStatuses(s => {
-          const nextADCS = (activeFault === 'seu' || activeFault === 'adcs_fail') ? 'fault' : 'nominal';
-          const nextOBC = activeFault === 'leak' ? 'fault' : (cpuTemp > 45 ? 'warning' : 'nominal');
-          const nextPower = activeFault === 'battery_fail' ? 'fault' : (batteryPct < 50 ? 'warning' : 'nominal');
-          const nextComms = activeFault === 'injection' ? 'warning' : (isInContact ? 'nominal' : 'warning');
-          const nextPayload = activeFault === 'leak' ? 'warning' : 'nominal';
-          const nextWatchdog = activeFault ? 'warning' : 'nominal';
-
-          return { 
-            OBC: nextOBC, 
-            ADCS: nextADCS, 
-            Power: nextPower, 
-            Comms: nextComms,
-            Payload: nextPayload,
-            Watchdog: nextWatchdog 
-          };
-        });
-
-        // Simulating registers
-        setObcRegisters(regs => {
-          const offset = regs.ticks + 1;
-          const nextPC = '0x' + (32804 + offset * 4).toString(16).toUpperCase();
-          const nextTicks = offset;
-          const nextSP = '0x1FFF00' + Math.max(10, 160 - (offset % 10) * 4).toString(16).toUpperCase().padStart(2, '0');
-          const nextErrors = hasFault ? regs.errors + 1 : regs.errors;
-          return {
-            ...regs,
-            PC: nextPC,
-            SP: nextSP,
-            ticks: nextTicks,
-            errors: nextErrors,
-          };
-        });
-
-        // Periodically inject minor system anomalies if no major fault is present
-        if (!hasFault && Math.random() < 0.02) {
-          const sub = ['Power', 'OBC', 'Payload'][Math.floor(Math.random() * 3)] as any;
-          setAnomalyFeed(feed => [
-            {
-              id: Date.now().toString(),
-              timestamp: nextTime,
-              subsystem: sub,
-              anomalyScore: Math.floor(35 + Math.random() * 20),
-              status: 'warning',
-              actionTaken: sub === 'Power' ? 'Thermistor shunt calibration adjustments verified' :
-                           sub === 'OBC' ? 'Re-scheduled telemetry transmission cycle' : 'Payload CCD light sensor reset completed'
-            },
-            ...feed.slice(0, 7)
-          ]);
-        }
-
-        return [...prev.slice(1), nextPoint];
-      });
-
-      // Update Screen 2 logs in background
-      if (wsConnected) {
-        const timestampLog = new Date().toISOString();
-        setFastapiLogs(prev => [...prev, `[${timestampLog}] WS STREAM BROADCAST. Frame ID: ${Math.floor(Math.random()*10000)}`].slice(-25));
-        
-        if (activeFault) {
-          setClassifierLogs(prev => [...prev, `[${timestampLog}] WARN [AI-1]: Anomaly persistent on register matrix. LOCK IN PROCESS.`].slice(-25));
-          setWatchdogLogs(prev => [...prev, `[${timestampLog}] HEARTBEAT: WARNING - Core telemetry out of bounds.`].slice(-25));
-        } else {
-          setClassifierLogs(prev => [...prev, `[${timestampLog}] AI-1 Inference: All vectors NOMINAL. Confidence: 99.8%`].slice(-25));
-          setWatchdogLogs(prev => [...prev, `[${timestampLog}] HEARTBEAT: OK. 100% thread integrity.`].slice(-25));
-        }
+    let alive = true;
+    (async () => {
+      const t = () => new Date().toISOString();
+      try {
+        const c = await api.config();
+        if (!alive) return;
+        setFastapiLogs([
+          `[${t()}] Connected to ${c?.api?.public_base ?? API_BASE}`,
+          `[${t()}] Emulator tick ${c?.satellite?.norad_id ? `NORAD ${c.satellite.norad_id}` : ''}`,
+          `[${t()}] Verification gate: ${c?.security?.require_command_verification ? 'ON' : 'OFF'}`,
+        ]);
+      } catch (e: any) {
+        if (!alive) return;
+        setFastapiLogs([`[${t()}] BACKEND UNREACHABLE at ${API_BASE} — ${e.message}`]);
       }
-    }, 1000);
 
-    return () => clearInterval(timer);
-  }, [wsConnected, isInContact, activeFault]);
+      try {
+        const p = await api.pipelineStatus();
+        if (!alive) return;
+        setClassifierLogs([
+          `[${t()}] AI-1 artifacts: ${p.artifacts_ready ? 'LOADED' : 'MISSING'}`,
+          p.artifacts_ready
+            ? `[${t()}] seq_len=${p.seq_len} features=${p.feature_cols?.length ?? '?'}`
+            : `[${t()}] ${p.hint ?? 'Run train_classifier.py'}`,
+        ]);
+      } catch (e: any) {
+        if (!alive) return;
+        setClassifierLogs([`[${t()}] AI-1 status unavailable — ${e.message}`]);
+      }
+
+      try {
+        const l = await api.links();
+        if (!alive) return;
+        setRecoveryLogs([
+          `[${t()}] AI-2 agent: ${l.links?.ai2_agent?.detail ?? 'unknown'}`,
+          `[${t()}] RF station: ${l.links?.rf_station?.detail ?? 'unknown'}`,
+        ]);
+        setWatchdogLogs([
+          `[${t()}] Link check: ${Object.values(l.links).filter((x: any) => x.connected).length}/${Object.keys(l.links).length} components connected`,
+        ]);
+      } catch {
+        if (!alive) return;
+        setRecoveryLogs([`[${t()}] Link status unavailable`]);
+      }
+
+      try {
+        const cs = await api.cryptoStatus();
+        if (!alive) return;
+        setCryptoLogs([
+          `[${t()}] CY-1 ${cs.cy1_online ? 'ONLINE' : 'OFFLINE'} — mode: ${cs.mode}`,
+          `[${t()}] endpoint: ${cs.endpoint}`,
+        ]);
+      } catch (e: any) {
+        if (!alive) return;
+        setCryptoLogs([`[${t()}] Crypto status unavailable — ${e.message}`]);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  // 3. WIRING: live telemetry from Pi #1.
+  // This entire block used to be a 1 s setInterval fabricating every metric
+  // with Math.random() and switching on a locally-held `activeFault`. Every
+  // value below now comes from the emulator's real telemetry frame.
+  useEffect(() => {
+    const sock = subscribeTelemetry(
+      (f: TelemetryFrame) => {
+        setWsConnected(true);
+        setActiveFault(f.fault_injected && f.fault_injected !== 'none' ? f.fault_injected : null);
+
+        // Chart series — straight from the frame.
+        setHistoryData(prev => [...prev.slice(-59), frameToPoint(f)]);
+
+        // Subsystem status — reported by the emulator, not inferred locally.
+        setStatuses({
+          OBC:      mapStatus(f.obc_status),
+          ADCS:     mapStatus(f.adcs_status),
+          Power:    mapStatus(f.power_status),
+          Comms:    mapStatus(f.comms_status),
+          Payload:  mapStatus(f.overall_health === 'fault' ? 'degraded' : 'nominal'),
+          Watchdog: f.fault_injected && f.fault_injected !== 'none' ? 'warning' : 'nominal',
+        });
+
+        // OBC registers — real register, error count and frame counter.
+        setObcRegisters(regs => ({
+          ...regs,
+          PC:     f.obc_register ?? regs.PC,
+          SP:     '0x1FFF00' + Math.max(0, Math.round(f.obc_memory_pct)).toString(16).toUpperCase().padStart(2, '0'),
+          FLAGS:  '0x' + Math.round((f.obc_cpu_pct ?? 0) * 100).toString(16).toUpperCase().padStart(8, '0'),
+          OPCODE: f.obc_status === 'nominal' ? 'ADDF' : 'TRAP',
+          ticks:  f.frame_id ?? regs.ticks,
+          errors: f.obc_error_count ?? regs.errors,
+        }));
+
+        setCountdownSecs(prev => (prev <= 1 ? 1122 : prev - 1));
+
+        setFastapiLogs(prev =>
+          [...prev, `[${new Date().toISOString()}] WS frame ${f.frame_id} — health=${f.overall_health ?? 'n/a'}`].slice(-25),
+        );
+      },
+      (up) => setWsConnected(up),
+    );
+    return () => sock.close();
+  }, []);
+
+  // WIRING: anomaly feed built from real fault transitions, not a 2% random roll.
+  const lastFaultRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (activeFault === lastFaultRef.current) return;
+    const prevFault = lastFaultRef.current;
+    lastFaultRef.current = activeFault;
+
+    const ts = new Date().toLocaleTimeString();
+    if (activeFault) {
+      const subsystem: AnomalyAlert['subsystem'] =
+        activeFault === 'SEU' ? 'ADCS'
+        : activeFault === 'software_bug' ? 'OBC'
+        : activeFault === 'firmware_corruption' ? 'Power'
+        : 'Comms';
+      setAnomalyFeed(feed => [
+        { id: `${Date.now()}`, timestamp: ts, subsystem, anomalyScore: 95,
+          status: 'fault', actionTaken: `Emulator reports ${activeFault} — AI-2 recovery available` },
+        ...feed.slice(0, 7),
+      ]);
+      setWatchdogLogs(prev => [...prev, `[${new Date().toISOString()}] HEARTBEAT: WARNING — ${activeFault} active.`].slice(-25));
+    } else if (prevFault) {
+      setAnomalyFeed(feed => [
+        { id: `${Date.now()}`, timestamp: ts, subsystem: 'Watchdog', anomalyScore: 5,
+          status: 'nominal', actionTaken: `${prevFault} cleared — satellite returned to nominal` },
+        ...feed.slice(0, 7),
+      ]);
+      setWatchdogLogs(prev => [...prev, `[${new Date().toISOString()}] HEARTBEAT: OK — fault cleared.`].slice(-25));
+    }
+  }, [activeFault]);
+
+  // WIRING: agent/pipeline events drive the recovery + crypto terminals.
+  useEffect(() => {
+    const sock = subscribeEvents((e) => {
+      const t = new Date().toISOString();
+      const p: any = e.payload ?? {};
+      if (e.event.startsWith('pipeline') || e.event.startsWith('recovery')) {
+        setRecoveryLogs(prev => [...prev, `[${t}] ${e.event}: ${JSON.stringify(p).slice(0, 140)}`].slice(-25));
+        setIsRecovering(e.event === 'pipeline_started' || e.event === 'recovery_started');
+      }
+      if (e.event === 'uplink_sent') {
+        setCryptoLogs(prev => [...prev, `[${t}] Signed uplink: ${p.procedure_name} (${p.commands_count} commands)`].slice(-25));
+      }
+      if (e.event === 'pipeline_complete' && p.classified_fault) {
+        const conf = typeof p.classifier_confidence === 'number'
+          ? `${(p.classifier_confidence * 100).toFixed(1)}%` : 'n/a';
+        setClassifierLogs(prev => [...prev, `[${t}] AI-1 -> ${p.classified_fault} @ ${conf}`].slice(-25));
+      }
+    });
+    return () => sock.close();
+  }, []);
 
 
   // 4. HTML5 Canvas waterfall visualizer effect (ticks for Screen 3)
@@ -491,22 +584,29 @@ export default function SatelliteDashboard() {
       const imgData = ctx.createImageData(width, 1);
       const centerBin = width * 0.52; // Target 137.9 MHz signal on Ku band
       
+      // WIRING: bins come from the RTL-SDR on Pi #2 via /rf/spectrum
+      // (proxied through Pi #1). When Pi #2 is offline `rfBins` is empty and
+      // the canvas renders a flat noise floor — the panel then shows an
+      // "RF OFFLINE" badge rather than animating fake signal.
+      const bins = rfBinsRef.current;
+      const haveRf = bins.length > 0;
+
       for (let x = 0; x < width; x++) {
-        let noise = Math.random() * 25;
-        
-        // If ground contact is established, we display a clear signal wave streak down center!
-        if (isInContact) {
+        let noise: number;
+
+        if (haveRf) {
+          // Resample the real power spectrum across the canvas width.
+          const b = bins[Math.floor((x / width) * bins.length)];
+          // dBm (roughly -120..-20) -> 0..100 display scale
+          noise = Math.max(0, Math.min(100, (b + 120) * (100 / 100)));
+        } else {
+          noise = 8; // flat floor, no invented signal
+        }
+
+        if (haveRf && isInContact) {
           const distanceToCenter = Math.abs(x - centerBin);
           if (distanceToCenter < 12) {
-            // Signal carrier streak
-            noise += (12 - distanceToCenter) * 18 + Math.random() * 55;
-          }
-          // Jamming waves if command injection is active
-          if (activeFault === 'injection') {
-            const jamDist = Math.abs(x - (centerBin + Math.sin(Date.now() * 0.01) * 60));
-            if (jamDist < 16) {
-              noise += (16 - jamDist) * 12 + Math.random() * 65;
-            }
+            noise += (12 - distanceToCenter) * 4;
           }
         }
 
@@ -1713,8 +1813,15 @@ export default function SatelliteDashboard() {
                         const factor = isInContact ? Math.exp(-Math.pow((x - 416) / 20, 2)) : 0;
                         const jamFactor = activeFault === 'injection' && isInContact ? Math.exp(-Math.pow((x - 220) / 30, 2)) : 0;
                         
-                        const noiseVal = 95 - Math.random() * 8 
-                          - (factor * 75) 
+                        // WIRING: sampled from the live RTL-SDR spectrum when
+                        // Pi #2 is online; a flat floor otherwise. Previously
+                        // re-randomised on every React render.
+                        const rf = rfBinsRef.current;
+                        const rfVal = rf.length
+                          ? 95 - Math.max(0, Math.min(90, (rf[Math.floor((i / 41) * rf.length)] + 120)))
+                          : 95;
+                        const noiseVal = rfVal
+                          - (factor * 75)
                           - (jamFactor * 52)
                           - (Math.sin(x*0.06 + spectrumPhaseRef.current * 0.1) * 3);
                         return `L ${x} ${noiseVal}`;

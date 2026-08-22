@@ -8,7 +8,19 @@
 
 ## Overview
 
-This module implements a **production-grade post-quantum cryptography layer** for the DeadSat Resurrection ground station. Every recovery command is signed with a hybrid Ed25519 + ML-DSA-65 signature before uplink. Commands with invalid, expired, or replayed signatures are rejected before execution.
+This module implements a **hybrid post-quantum cryptography layer** for the DeadSat Resurrection ground station. Every recovery command is signed with a hybrid Ed25519 + ML-DSA-65 signature before uplink. Commands with invalid, expired, or replayed signatures are rejected before execution.
+
+> **Scope of that claim.** It holds **only when real liboqs and PyNaCl are
+> installed**. With the `mock_oqs_nacl` development shim active the primitives
+> are fakes — see [Post-quantum dependency (liboqs)](#post-quantum-dependency-liboqs-—-is-it-actually-required)
+> below. In that state `/crypto/sign` refuses with 503 and `/crypto/health`
+> reports `status: mock`, so the layer fails closed rather than pretending;
+> but nothing here is post-quantum until liboqs is built.
+>
+> "Production-grade" was dropped from this sentence deliberately. The layer has
+> not been deployed, audited, or run against an adversary, and it depends on a
+> single-node Redis for replay protection that degrades to a process-local
+> store when Redis is absent.
 
 | Standard | Algorithm | Type |
 |---|---|---|
@@ -44,7 +56,7 @@ This module implements a **production-grade post-quantum cryptography layer** fo
 | `sign.py` | Dual signature + TTL 120s + nonce generation |
 | `verify.py` | Dual verify + expiry check, fail-fast ordering |
 | `ledger.py` | SQLite hash-chain ledger + watchdog thread (10s interval) |
-| `nonce.py` | Redis-backed nonce store, `hmac.compare_digest()`, 24h auto-expiry |
+| `nonce.py` | Redis-backed nonce store, atomic `SET NX EX`, 24h auto-expiry |
 | `rogue_detector.py` | Rogue command detector — 4 alert types, SEVERITY dict |
 | `crypto_routes.py` | FastAPI router — 7 endpoints, CORS, rate limiting |
 
@@ -56,9 +68,9 @@ This module implements a **production-grade post-quantum cryptography layer** fo
 |---|---|
 | Post-Quantum signing | ML-DSA-65 (NIST FIPS 204 — 2024) |
 | Classical signing | Ed25519 — both must verify |
-| Replay protection | Redis atomic SET, 24h TTL |
+| Replay protection | Redis atomic `SET NX EX`, 24h TTL, consumed at **verify** time |
 | Tamper detection | SHA-256 hash-chain + watchdog thread |
-| Timing attack resistance | `hmac.compare_digest()` everywhere |
+| Timing attack resistance | Constant-time comparison inside libsodium (Ed25519) and liboqs (ML-DSA-65). `hmac.compare_digest()` in `rogue_detector.py` where signatures are compared against the ledger. |
 | Rate limiting | 30/min on `/sign`, 60/min elsewhere |
 | Command expiry | TTL 120s — expired commands rejected |
 | CORS | Configured for FE-2 dashboard |
@@ -102,6 +114,68 @@ pip install fastapi uvicorn pynacl redis slowapi httpx
 redis-cli ping
 python3 -c "import oqs; print('ML-DSA-65' in oqs.get_enabled_sig_mechanisms())"
 ```
+
+---
+
+### Post-quantum dependency (liboqs) — is it actually required?
+
+**Yes. In production, real `liboqs-python` is mandatory.** `mock_oqs_nacl.py` is a
+development fallback for machines where liboqs is not built, and it is **not
+secure**. This section exists because that distinction was previously
+undocumented, and the failure mode is silent.
+
+| Package | How it installs | Status | Mockable? |
+|---|---|---|---|
+| `pynacl` (Ed25519) | `pip install pynacl` — wheels on PyPI | **Hard requirement.** Now in `requirements.txt`. | No reason to. Never rely on the shim for this. |
+| `redis` | `pip install redis` + a running redis-server | **Hard requirement.** Now in `requirements.txt`. | No |
+| `slowapi` | `pip install slowapi` | **Hard requirement.** Now in `requirements.txt`. | No |
+| `liboqs-python` (ML-DSA-65) | Build liboqs from source, then install the Python binding — **not on PyPI** | **Required in production.** Cannot be added to `requirements.txt`. | Dev only, see warning below |
+
+#### Why the shim cannot be the production path
+
+`mock_oqs_nacl.py` installs fake `oqs` and `nacl` modules into `sys.modules` when
+the real ones are missing. Its verification functions are unconditional passes:
+
+```python
+# mock_oqs_nacl.py:34  — mock oqs.Signature.verify
+return sig.startswith(expected_prefix) or sig.startswith(b"MOCK_") or b"MOCK" in sig
+
+# mock_oqs_nacl.py:59  — mock nacl VerifyKey.verify
+if not sig.startswith(expected_prefix) and not sig.startswith(b"MOCK_") and not b"MOCK" in sig:
+    raise BadSignatureError("Bad signature")
+```
+
+**Any byte string containing `MOCK` verifies successfully, under both algorithms.**
+
+The consequence is worse than a disabled check, because nothing downstream can
+tell. With the shim active:
+
+- `sign_command()` returns a signature the shim will always accept
+- CY-1 `/crypto/verify` returns `valid: true`
+- CY-1 `/crypto/health` returns `status: ok`, `self_test_passed: true` — the
+  self-test signs and verifies through the same shim, so it always passes
+- `/system/links` on Pi #1 reports **crypto: connected**
+- the recovery agent's verification gate passes
+- the ledger records the command as signed
+
+Every indicator in the system reads green while no cryptography has occurred.
+The only signal is a `[CRYPTO MOCK] liboqs not found` line on stdout at import
+time, which is invisible once the service is running under a process manager.
+
+Note also that Pi #1's own `/crypto/verify` rejects signatures whose hex begins
+with `MOCK_` — that guard does **not** catch shim-produced signatures, because
+they are hex-encoded before transmission and so no longer carry the prefix.
+
+#### Rules
+
+1. **Never demo or deploy on the shim.** Verify with the command above; it must
+   print `True`. If it prints `False` or raises, ML-DSA-65 is not available and
+   any post-quantum claim is unsupported.
+2. Treat a `[CRYPTO MOCK]` line in the logs as a failed start, not a warning.
+3. If the shim is retained for offline development, it must be made loud —
+   `/crypto/health` should report `mock_crypto: true` and `/system/links` should
+   surface it, so a mocked signer can never present as a real one. Tracked as
+   part of Prompt 4.0 in `docs/PHASE_PROMPTS_FINAL.md`.
 
 ---
 

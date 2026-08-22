@@ -1,22 +1,89 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Shield, Lock, Warning, Check } from './Icons';
+// WIRING: live crypto state from the CY-1 layer on Pi #1.
+import { api } from '../api';
 
 export default function SecurityConsole() {
   const [activeKey, setActiveKey] = useState<'DILITHIUM' | 'RSA_VULNERABLE'>('DILITHIUM');
   const [isRotating, setIsRotating] = useState(false);
-  const [securityScore, setSecurityScore] = useState(99);
-  const [activeLatticeMatrix, setActiveLatticeMatrix] = useState('LATTICE_MATRIX_MOD_q8380417');
-  const [entropyBits, setEntropyBits] = useState(256);
+  // WIRING: derived from real CY-1 state instead of a hardcoded 99.
+  const [securityScore, setSecurityScore] = useState(0);
+  const [activeLatticeMatrix, setActiveLatticeMatrix] = useState('awaiting CY-1 …');
+  const [entropyBits, setEntropyBits] = useState(0);
 
-  const handleKeyRotation = () => {
+  // Live crypto state
+  const [cyOnline, setCyOnline] = useState<boolean | null>(null);
+  const [cryptoMode, setCryptoMode] = useState<string>('—');
+  const [ledger, setLedger] = useState<any[]>([]);
+  const [alerts, setAlerts] = useState<any[]>([]);
+  const [verifyGate, setVerifyGate] = useState<boolean | null>(null);
+  const [lastError, setLastError] = useState<string>('');
+
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const s: any = await api.cryptoStatus();
+        if (!alive) return;
+        setCyOnline(Boolean(s.cy1_online));
+        setCryptoMode(s.mode ?? '—');
+        // ML-DSA-65 (Dilithium3) is a 256-bit-security lattice scheme; report
+        // it only when CY-1 is actually answering.
+        setEntropyBits(s.cy1_online ? 256 : 0);
+        setActiveLatticeMatrix(
+          s.cy1_online ? 'ML-DSA-65 (CRYSTALS-Dilithium3) · q=8380417' : 'CY-1 offline — no active key',
+        );
+        setActiveKey(s.cy1_online ? 'DILITHIUM' : 'RSA_VULNERABLE');
+      } catch (e: any) {
+        if (!alive) return;
+        setCyOnline(false);
+        setLastError(e.message);
+      }
+
+      try {
+        const l: any = await api.cryptoLedger();
+        if (alive) setLedger(Array.isArray(l.entries) ? l.entries : []);
+      } catch { if (alive) setLedger([]); }
+
+      try {
+        const a: any = await api.cryptoAlerts();
+        if (alive) setAlerts(Array.isArray(a.alerts) ? a.alerts : []);
+      } catch { if (alive) setAlerts([]); }
+
+      try {
+        const c: any = await api.config();
+        if (alive) setVerifyGate(Boolean(c?.security?.require_command_verification));
+      } catch { /* leave unknown */ }
+    };
+    poll();
+    const t = setInterval(poll, 5000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  // Security score reflects the actual posture, not a fixed number.
+  useEffect(() => {
+    let score = 0;
+    if (cyOnline) score += 50;          // post-quantum signer reachable
+    if (verifyGate) score += 30;        // verification enforced before execution
+    if (alerts.length === 0) score += 20; // no outstanding rogue-command alerts
+    setSecurityScore(score);
+  }, [cyOnline, verifyGate, alerts.length]);
+
+  // WIRING: key rotation asks CY-1 to re-key. Previously a 2.5 s timeout that
+  // set the score to 100 and invented an "ULTRA_SECURE" lattice label.
+  const handleKeyRotation = async () => {
     setIsRotating(true);
-    setTimeout(() => {
+    setLastError('');
+    try {
+      await api.cryptoRotate();
+      const s: any = await api.cryptoStatus();
+      setCyOnline(Boolean(s.cy1_online));
+      setCryptoMode(s.mode ?? '—');
+    } catch (e: any) {
+      setLastError(`Key rotation failed — ${e.message}`);
+    } finally {
       setIsRotating(false);
-      setActiveKey('DILITHIUM');
-      setSecurityScore(100);
-      setEntropyBits(384);
-      setActiveLatticeMatrix('LATTICE_MATRIX_MOD_q10485761_ULTRA_SECURE');
-    }, 2500);
+    }
   };
 
   return (
@@ -30,8 +97,20 @@ export default function SecurityConsole() {
               <Shield className="w-5 h-5 text-signal-green" />
               <span>POST-QUANTUM CRYPTO CONSOLE</span>
             </h2>
-            <span className="font-mono text-[10px] bg-quantum-purple/10 text-quantum-purple font-bold px-2.5 py-0.5 rounded-sm uppercase tracking-wider">
-              PQC STATUS: HARDENED
+            {/* Was the static string "PQC STATUS: HARDENED" — shown even when
+                the crypto backend was the development shim, i.e. when nothing
+                was hardened at all. cyOnline already drives four other
+                elements in this component; the badge now reads from it too. */}
+            <span className={`font-mono text-[10px] font-bold px-2.5 py-0.5 rounded-sm uppercase tracking-wider ${
+              cyOnline
+                ? 'bg-quantum-purple/10 text-quantum-purple'
+                : 'bg-threat-red/10 text-threat-red'
+            }`}>
+              {cyOnline === null
+                ? 'PQC STATUS: CHECKING…'
+                : cyOnline
+                  ? 'PQC STATUS: HARDENED'
+                  : `PQC STATUS: ${(cryptoMode || 'UNVERIFIED').toUpperCase().replace('_', ' ')}`}
             </span>
           </div>
 

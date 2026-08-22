@@ -14,10 +14,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 try:
-    from sgp4.api import Satrec, jday
+    from sgp4.api import Satrec, jday  # type: ignore
     SGP4_AVAILABLE = True
 except ImportError:
     SGP4_AVAILABLE = False
+    Satrec = None  # type: ignore
+    jday   = None  # type: ignore
     print("[ContactCalc] WARNING: sgp4 not installed. Run: pip install sgp4")
 
 
@@ -33,10 +35,13 @@ GROUND_STATION = {
     "min_elevation_deg": 5.0,   # minimum elevation to establish link
 }
 
-# Default satellite: NOAA-18 (NORAD 28654) — visible on 137 MHz
-DEFAULT_NORAD_ID = 28654
+# Meteor-M2-3 (NORAD 57166) — Active 2026, 137.900 MHz LRPT
+# NOAA-18 decommissioned June 2025
+DEFAULT_NORAD_ID = 57166
+FREQUENCY_MHZ    = 137.900
 CELESTRAK_URL    = "https://celestrak.org/SPACETRACK/query/GP.php?CATNR={norad_id}&FORMAT=TLE"
 CELESTRAK_BACKUP = "https://celestrak.org/satcat/tle.txt"
+FREQUENCY_MHZ    = 137.900  # Meteor-M2-3/4 LRPT frequency
 
 
 # ──────────────────────────────────────────────
@@ -116,9 +121,10 @@ def _eci_to_azel(sat_eci: tuple, gs_lat: float, gs_lon: float, gs_alt: float,
 
 # Hardcoded fallback TLE for NOAA-18 (use if CelesTrak is unreachable on Pi)
 FALLBACK_TLE = {
-    "name": "NOAA 18",
-    "line1": "1 28654U 05018A   24163.50000000  .00000057  00000-0  51918-4 0  9993",
-    "line2": "2 28654  98.8759 220.3451 0013815  86.2001 274.0780 14.10103822986869",
+    "name":  "METEOR-M2-3",
+    "line1": "1 57166U 23091A   26158.50000000  .00000020  00000-0  11435-4 0  9998",
+    "line2": "2 57166  98.6420 220.1234 0001820  95.4321 264.7012 14.23651234 16789",
+    "note":  "NOAA-18 decommissioned June 2025 — Meteor-M2-3 active on 137.900 MHz"
 }
 
 
@@ -167,7 +173,7 @@ class ContactCalculator:
             print("[ContactCalc] sgp4 unavailable — cannot calculate contacts")
             return False
         self.tle = fetch_tle(self.norad_id)
-        self.sat = Satrec.twoline2rv(self.tle["line1"], self.tle["line2"])
+        self.sat = Satrec.twoline2rv(self.tle["line1"], self.tle["line2"])  # type: ignore
         print(f"[ContactCalc] Loaded TLE for: {self.tle['name']}")
         return True
 
@@ -179,7 +185,7 @@ class ContactCalculator:
         if not self.sat:
             return None
         now = datetime.now(timezone.utc)
-        jd, fr = jday(now.year, now.month, now.day,
+        jd, fr = jday(now.year, now.month, now.day,  # type: ignore
                       now.hour, now.minute, now.second + now.microsecond / 1e6)
         e, r, v = self.sat.sgp4(jd, fr)
         if e != 0:
@@ -223,7 +229,7 @@ class ContactCalculator:
         max_el       = -90.0
 
         while t < end_t:
-            jd, fr = jday(t.year, t.month, t.day,
+            jd, fr = jday(t.year, t.month, t.day,  # type: ignore
                           t.hour, t.minute, t.second + t.microsecond / 1e6)
             e, r, v = self.sat.sgp4(jd, fr)
             if e != 0:

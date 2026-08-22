@@ -118,46 +118,88 @@ Most hackathon "post-quantum crypto" projects call one library function and stop
 
 ## 📟 Live System Proof
 
-This isn't a mockup — here's what actually prints on boot.
+> **This section was rewritten on 2026-08-15.** It previously opened *"This
+> isn't a mockup — here's what actually prints on boot"* above three transcripts
+> that the code does not produce. Every banner was wrong (`[CY-1]` vs the actual
+> `[CRYPTO]`, `[EMULATOR]` vs `[Emulator]`), four indented self-check lines
+> existed nowhere in the codebase, the recovery JSON used four field names the
+> log writer never emits, and one line claimed the digital twin was *"baseline
+> seeded from SatNOGS"* when `main.py` disables SatNOGS seeding explicitly.
+>
+> Presenting invented output as captured output is the most damaging claim a
+> README can make, because it is the one a reviewer can check in thirty seconds.
+> What follows is verifiable: every string is quoted from the source line that
+> prints it, and the JSON is a real file in this repository.
 
-**Pi #1 — Ground Station Compute:**
+### What Pi #1 prints on boot
+
+Run `python3 main.py`. The banners below are emitted by these exact lines:
+
+| Output | Emitted by |
+|---|---|
+| `[CRYPTO] Initialising crypto layer...` | `crypto/crypto_routes.py` → `startup_crypto()` |
+| `[CRYPTO] Key fingerprint: <fp>` | same |
+| `[CRYPTO] SYSTEM SELF-CHECK: ALL PASS` *(or `FAILED`)* | same — signs and verifies a `SELFTEST_COMMAND` |
+| `[WATCHDOG] Started — checking every 10s` | `crypto/ledger.py` → `start_watchdog()` |
+| `[Emulator] Started — streaming telemetry every 1.0s` | `emulator/satellite_emulator.py` → `start()` |
+| `[Config] ── DeadSat deployment ─────` | `config.py` → `print_banner()` |
+| `[API] DeadSat FastAPI server started` | `main.py` lifespan |
+
+Two caveats the old transcript hid:
+
+- **The self-test passes even with fake cryptography.** It signs and verifies
+  through the same primitives, so if `liboqs`/`PyNaCl` are missing the shim
+  satisfies it. Check `[CRYPTO MOCK]` lines and `GET /crypto/status`
+  (`mock_crypto: true`) — not the self-test.
+- **The emulator is not seeded from SatNOGS.** `main.py` disables it: *"SatNOGS
+  seeding disabled — default nominal values used (API latency too high for
+  reliable startup seeding)"*. It boots from the nominal defaults in the
+  subsystem dataclasses. `POST /seed` triggers seeding manually.
+
+### What Pi #2 prints
+
+`python3 rf/spectrum_display.py` — format strings from `rf/meteor_predictor.py`
+and `rf/rtlsdr_reader.py`:
 
 ```text
-$ python3 main.py
-[CY-1] SYSTEM SELF-CHECK: ALL PASS
-       Hybrid keypair (Ed25519 + ML-DSA-65) ... OK
-       Sign / Verify loop .................... OK
-       Ledger write ........................... OK
-       Hash chain integrity .................. OK
-
-[CY-1] Ground Station Key Fingerprint: SHA256:a3f8b2c1...
-[WATCHDOG] Ledger integrity monitor started (10s interval)
-[EMULATOR] Digital twin initialized — baseline seeded from SatNOGS
-[API] FastAPI server running on http://0.0.0.0:8000
+[PREDICTOR] <sat> loaded — source: <src>
+[PASS] <sat> — AOS: <iso> | Max el: <deg>° | ...
+[RTLSDR] Device opened — 137.900 MHz gain=40
+[RTLSDR] Doppler — velocity=<m/s> shift=<Hz> new_freq=<MHz>
 ```
 
-**Pi #2 — RF Ground Station**, tracking a real pass over Ahmedabad:
+If no RTL-SDR is present the reader prints `[RTLSDR] Device not available —
+using mock` and synthesises the spectrum. The ground station is **Ahmedabad
+(23.0225 N, 72.5714 E)** — `GROUND_STATION` in `emulator/contact_calculator.py`.
 
-```text
-$ python3 rf/spectrum_display.py
-[PREDICTOR] Meteor-M2-4 loaded — NORAD 59051 (source: celestrak.org)
-[PASS] Meteor-M2-4 — AOS: 2026-06-14 08:55:12 UTC | Max el: 30.7° | Duration: 9.2 min | Quality: GOOD
-[RTLSDR] Device opened — 137.900 MHz, gain=40
-[RTLSDR] Doppler — velocity=6.1 m/s shift=-2.8 Hz new_freq=137.9000 MHz
-```
+### A completed recovery run
 
-**A completed recovery run**, written to `recovery_logs/`:
+Genuine file: `recovery_logs/20260612_105922_SEU_SUCCESS.json`, written by
+`_persist_log()` in `agents/recovery_agent.py`.
 
 ```json
 {
   "fault_type": "SEU",
-  "subsystem": "ADCS",
-  "procedure": "ADCS_MEMORY_SCRUB_v2",
-  "signature_algorithms": ["Ed25519", "ML-DSA-65"],
-  "ledger_verified": true,
-  "success": true
+  "fault_confidence": 1.0,
+  "norad_id": 28654,
+  "catalog_baselines": {
+    "name": "NOAA 18",
+    "mean_motion_nominal": 14.13728072,
+    "period_minutes": 101.86,
+    "altitude_km_approx": 853.8,
+    "source": "csv_gp"
+  },
+  "procedure_used": "ADCS_MEMORY_SCRUB_v2",
+  "attempts": 1,
+  "success": true,
+  "recovery_log": [ /* 8 steps: select_procedure … monitor_recovery */ ]
 }
 ```
+
+Note this log predates the current code: it records NOAA-18, which was
+decommissioned in June 2025 and has since been replaced as the default target
+(see `real_data_fetcher.py`), and it was produced before the verification gate
+and the fault-aware `apply_recovery()` existed.
 
 ---
 
@@ -317,10 +359,60 @@ GET /rf/status
 ## 🤖 AI Layer
 
 **AI-1 — Forensic Fault Classifier**
-A Transformer Encoder (multi-head self-attention) runs alongside an Isolation Forest anomaly detector over a 60-second sliding window of 13 telemetry features — OBC temperature, error count, CPU/memory load, ADCS rate and pointing error, reaction-wheel speed, power draw, battery state, bus voltage, signal strength, and uplink/downlink status. Output: fault type, affected subsystem, register, confidence score, and an `is_attack` flag.
+A Transformer Encoder (multi-head self-attention) runs alongside an Isolation Forest anomaly detector over a sliding window of **8 consecutive TLE epochs × 11 orbital-element features**:
+
+`MEAN_MOTION`, `ECCENTRICITY`, `INCLINATION`, `RA_OF_ASC_NODE`, `ARG_OF_PERICENTER`, `MEAN_ANOMALY`, `BSTAR`, `MEAN_MOTION_DOT`, `MEAN_MOTION_DDOT`, plus two derived: `TLE_AGE_HOURS` and `REV_DELTA`.
+
+Output: fault type and confidence, plus an anomaly flag from the Isolation Forest.
+
+> **Corrected.** This section previously claimed *"a 60-second sliding window of 13 telemetry features — OBC temperature, error count, CPU/memory load, ADCS rate…"*. That describes the **V1** classifier, which consumed subsystem telemetry. V2 — the model this project trains and ships — consumes **orbital elements**, a different input space entirely. The window is 8 epochs (`CONFIG["seq_len"]`), not 60 seconds; at one epoch per revolution that is roughly 12 hours, not a minute. There is no `is_attack` flag in the V2 output; `COMMAND_INJECTION` is one of the four classes.
+>
+> The authoritative list is `models/feature_spec.py:FEATURE_COLS` — a dependency-free module precisely so the spec can be read without importing torch. Measured: `len(FEATURE_COLS) == 11`.
 
 **AI-2 — Recovery Agent & Satellite Emulator**
 A Python state-machine emulator models OBC, ADCS, Power, and Comms subsystems, seeded from real SatNOGS baselines, and supports four fault-injection modes. A LangGraph agent receives the fault report, selects a recovery procedure from `procedure_library.json`, requests a signed command from the crypto layer, schedules the uplink for the next ground-contact window (computed via SGP4 + live TLE), and **automatically falls back to an alternate procedure if the first attempt does not meet its success criteria**.
+
+### End-to-End Pipeline
+
+`pipeline.py` connects both halves in one command:
+
+```
+SatelliteCatalog ──▶ SatelliteEmulator ──▶ AI-1 Classifier ──▶ AI-2 Recovery Agent
+ 712 real GP/TLE      telemetry + fault      IsolationForest       LangGraph 9-node
+ elements from CSV    injection              + Transformer         graph + Dilithium
+```
+
+```bash
+# 1. Train AI-1 on the real orbital datasets (writes model_artifacts/)
+python train_classifier.py
+
+# 2. Run the full inject -> classify -> recover cycle
+python pipeline.py --all                     # all 4 fault types
+python pipeline.py --fault SEU               # one fault type
+python pipeline.py --all --skip-classifier   # AI-2 only, no artifacts needed
+python pipeline.py --all --norad-id 25544    # any satellite in the catalog
+
+# 3. Verify every integration seam
+python test_integration.py
+```
+
+**`models/classifier_inference.py` — the AI-1 → AI-2 bridge.**
+The classifier emits `UPPER_SNAKE_CASE` fault classes (`SOFTWARE_BUG`) while
+`procedure_library.json` is keyed in `lower_snake_case` (`software_bug`), and
+the recovery agent does a direct dict lookup. Unnormalised, that lookup raises
+`KeyError` and recovery fails silently. This module is the single place that
+touches both sides: it applies the canonical `FAULT_KEY_MAP` and emits the
+exact `fault_report` schema `RecoveryAgent.run()` expects.
+
+**`models/feature_spec.py` — dependency-free spec.**
+`CONFIG`, `FEATURE_COLS`, `FAULT_LABELS` and `IDX_TO_LABEL` live here and are
+re-exported by `satellite_fault_classifier_V2.py`. Because this module imports
+nothing beyond the standard library, the pipeline, the bridge and the test
+suite all work on a machine without PyTorch installed — the classifier stage
+degrades gracefully to `--skip-classifier` instead of crashing on import.
+
+> Legacy `from ml.classifier_inference import ...` paths still resolve via a
+> shim in `ml/`, but `models.` is canonical.
 
 ---
 
@@ -406,6 +498,41 @@ python3 main.py
 
 The FastAPI server starts on `http://0.0.0.0:8000`, running the emulator, AI-1 classifier, AI-2 recovery agent, and the full crypto layer (self-test + watchdog start automatically).
 
+#### Train AI-1 (required once, on a fresh clone)
+
+**The trained model is not committed to this repository.** It is a build output:
+~3.3 MB of binaries that would drift silently from the code that produced them
+and cannot be reviewed in a diff. A fresh clone therefore has AI-1 **DOWN**
+until you build it — `/system/links` reports `ai1_classifier: false`,
+`/pipeline/classify` returns 503, and the AI Diagnostics panel says so.
+
+Build it with two commands:
+
+```bash
+python3 generate_dataset.py --propagator sgp4 --verify   # writes data/synthetic_orbital_series.csv
+python3 train_classifier.py                              # writes model_artifacts/
+```
+
+This produces `model_artifacts/transformer_encoder.pt`, `isolation_forest.pkl`
+and `scaler.pkl` — the three files `models/classifier_inference.py` loads — plus
+a regenerated `docs/MODEL_CARD.md` containing the measured metrics.
+
+Both steps run **offline**; only the input CSVs are needed, and both are
+deterministic at the configured seed.
+
+> **Do not skip step 1.** `train_classifier.py` falls back to the raw snapshot
+> CSVs if the propagated series is absent, and warns loudly when it does. Those
+> hold one epoch per satellite, so three of the four fault rules can never fire
+> and ~95% of rows collapse to `SOFTWARE_BUG`. Artifacts built that way load
+> fine and classify nothing.
+
+Verify:
+
+```bash
+curl localhost:8000/pipeline/status      # artifacts_ready: true
+curl localhost:8000/system/links         # ai1_classifier: connected
+```
+
 ### Pi #2 — RF Ground Station
 
 ```bash
@@ -422,9 +549,21 @@ Runs a live spectrum display on the Pi #2 monitor and exposes `GET /rf/status` o
 ### Frontend
 
 ```bash
-cd frontend/dashboard && npm install && npm run dev
-cd frontend/operator  && npm install && npm run dev
+cd frontend
+cp .env.example .env      # set VITE_API_BASE to Pi #1, e.g. http://192.168.1.50:8000
+npm install
+npm run dev               # serves on :3000, binds 0.0.0.0
 ```
+
+> **If you set `DEADSAT_API_KEY` on Pi #1**, set `VITE_API_KEY` to the same value.
+> Both the REST calls and the WebSockets require it — an unauthenticated socket
+> is now closed with code 1008 rather than streaming telemetry to anyone on the
+> LAN. `GET /system/links` reports whether the key you sent was accepted.
+
+> **If you open the dashboard from another machine**, add that origin to
+> `DEADSAT_CORS_ORIGINS` on Pi #1. WebSockets are exempt from CORS, so
+> otherwise the header reads `LIVE TM` while every panel that needs a REST call
+> stays blank. See [docs/WIRING.md](docs/WIRING.md#cors--the-one-that-will-bite-you-on-demo-day).
 
 ---
 
@@ -437,8 +576,11 @@ cd frontend/operator  && npm install && npm run dev
 | `/telemetry/history?n=60` | `GET` | Last *n* telemetry frames from the emulator's ring buffer. |
 | `/fault/inject` | `POST` | Inject `SEU`, `software_bug`, `firmware_corruption`, or `command_injection`. |
 | `/recovery/trigger` | `POST` | Hand off a fault report to the AI-2 recovery agent. |
+| `/pipeline/status` | `GET` | Whether the AI-1 artifacts are trained and loadable. |
+| `/pipeline/classify` | `POST` | AI-1 only — orbital window → fault report. |
+| `/pipeline/run` | `POST` | Full cycle on the live emulator: inject → classify → recover. Progress streams on `/ws/events`. |
 | `/ws/telemetry` | `WS` | Live telemetry stream for the dashboard. |
-| `/ws/events` | `WS` | Live recovery status + alert stream. |
+| `/ws/events` | `WS` | Live recovery status + alert stream. Pipeline runs emit `pipeline_started`, `pipeline_complete`, `pipeline_failed`. |
 
 ### Crypto Layer
 

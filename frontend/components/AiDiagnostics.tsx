@@ -1,45 +1,91 @@
 import { useState, useEffect } from 'react';
 import { Cpu, Warning, Check, Activity } from './Icons';
+// WIRING: AI-1 status and classification now come from the backend.
+import { api, subscribeTelemetry, TelemetryFrame } from '../api';
 
 export default function AiDiagnostics() {
   const [anomalyThreshold, setAnomalyThreshold] = useState(85);
   const [activeModel, setActiveModel] = useState<'transformer_seq' | 'adcs_lstm'>('transformer_seq');
-  const [confidenceScore, setConfidenceScore] = useState(99.41);
+  // WIRING: real classifier confidence, not a random walk between 98.5–99.9.
+  // 0 until AI-1 actually returns a classification.
+  const [confidenceScore, setConfidenceScore] = useState(0);
   const [isCalibrating, setIsCalibrating] = useState(false);
+  const [artifactsReady, setArtifactsReady] = useState<boolean | null>(null);
+  const [statusHint, setStatusHint] = useState<string>('checking AI-1 …');
+  const [lastClass, setLastClass] = useState<string>('—');
+
+  // WIRING: the five rows are now live telemetry channels from the emulator
+  // rather than fixed strings. Thresholds mirror the emulator's own limits.
   const [telemetryStreams, setTelemetryStreams] = useState([
-    { name: "ADCS rotational variance", value: "2.41 rad/s", status: "WARNING" },
-    { name: "Propellant thermal index", value: "291 K", status: "NOMINAL" },
-    { name: "Solar array voltage", value: "118.4 V", status: "NOMINAL" },
-    { name: "Core clock fluctuation", value: "+0.14 ppm", status: "NOMINAL" },
-    { name: "S-band carrier SNR", value: "4.2 dB", status: "CRITICAL" }
+    { name: 'ADCS rotational variance', value: '—', status: 'NOMINAL' },
+    { name: 'OBC core temperature',     value: '—', status: 'NOMINAL' },
+    { name: 'Solar array output',       value: '—', status: 'NOMINAL' },
+    { name: 'OBC CPU load',             value: '—', status: 'NOMINAL' },
+    { name: 'RF downlink strength',     value: '—', status: 'NOMINAL' },
   ]);
 
-  // Fluctuating confidence core simulation
+  // AI-1 artifact status
   useEffect(() => {
-    const timer = setInterval(() => {
-      setConfidenceScore(prev => {
-        const drift = (Math.random() - 0.5) * 0.1;
-        const next = prev + drift;
-        return Number(Math.min(Math.max(next, 98.5), 99.9).toFixed(2));
+    let alive = true;
+    api.pipelineStatus()
+      .then((p: any) => {
+        if (!alive) return;
+        setArtifactsReady(Boolean(p.artifacts_ready));
+        setStatusHint(
+          p.artifacts_ready
+            ? `transformer + isolation forest loaded · seq_len=${p.seq_len} · ${p.feature_cols?.length ?? 0} features`
+            : (p.hint ?? 'artifacts missing — run train_classifier.py'),
+        );
+      })
+      .catch((e: any) => {
+        if (!alive) return;
+        setArtifactsReady(false);
+        setStatusHint(`AI-1 unreachable — ${e.message}`);
       });
-    }, 2000);
-    return () => clearInterval(timer);
+    return () => { alive = false; };
   }, []);
 
-  const handleRecalibrate = () => {
+  // Live telemetry -> the five diagnostic channels
+  useEffect(() => {
+    const sock = subscribeTelemetry((f: TelemetryFrame) => {
+      const lvl = (bad: boolean, warn: boolean) => bad ? 'CRITICAL' : warn ? 'WARNING' : 'NOMINAL';
+      setTelemetryStreams([
+        { name: 'ADCS rotational variance',
+          value: `${(f.adcs_rate_deg_s ?? 0).toFixed(3)} deg/s`,
+          status: lvl(f.adcs_status === 'fault', (f.adcs_rate_deg_s ?? 0) > 0.05) },
+        { name: 'OBC core temperature',
+          value: `${(f.obc_temp_c ?? 0).toFixed(1)} °C`,
+          status: lvl((f.obc_temp_c ?? 0) > 60, (f.obc_temp_c ?? 0) > 50) },
+        { name: 'Solar array output',
+          value: `${(f.power_w ?? 0).toFixed(1)} W`,
+          status: lvl((f.power_w ?? 0) < 50, (f.power_w ?? 0) < 75) },
+        { name: 'OBC CPU load',
+          value: `${(f.obc_cpu_pct ?? 0).toFixed(1)} %`,
+          status: lvl((f.obc_cpu_pct ?? 0) > 85, (f.obc_cpu_pct ?? 0) > 60) },
+        { name: 'RF downlink strength',
+          value: f.comms_downlink ? `${(f.signal_strength_dbm ?? 0).toFixed(1)} dBm` : 'DOWNLINK OFF',
+          status: lvl(!f.comms_downlink, (f.signal_strength_dbm ?? -100) < -90) },
+      ]);
+    });
+    return () => sock.close();
+  }, []);
+
+  // WIRING: "recalibrate" now runs a real AI-1 inference pass over the
+  // current orbital window instead of hardcoding 99.82% after a 2 s timeout.
+  const handleRecalibrate = async () => {
     setIsCalibrating(true);
-    setTimeout(() => {
+    try {
+      const r: any = await api.classify();
+      setConfidenceScore(Number(((r.confidence ?? 0) * 100).toFixed(2)));
+      setLastClass(`${r.fault_type} (raw: ${r.raw_fault_class}${r.anomaly_flag ? ', anomaly' : ''})`);
+      setStatusHint(`classified from live window · NORAD ${r.norad_id}`);
+    } catch (e: any) {
+      setConfidenceScore(0);
+      setLastClass('—');
+      setStatusHint(`classification failed — ${e.message}`);
+    } finally {
       setIsCalibrating(false);
-      setConfidenceScore(99.82);
-      // Change SNR to nominal for simulation success!
-      setTelemetryStreams(prev => 
-        prev.map(stream => 
-          stream.name === "S-band carrier SNR" 
-            ? { ...stream, value: "18.2 dB", status: "NOMINAL" } 
-            : stream
-        )
-      );
-    }, 2000);
+    }
   };
 
   return (

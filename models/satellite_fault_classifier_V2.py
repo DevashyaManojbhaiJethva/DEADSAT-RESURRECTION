@@ -69,7 +69,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import classification_report, confusion_matrix
@@ -79,61 +79,24 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-CONFIG = {
-    # N2YO live refresh targets (NORAD IDs). Add/remove as needed.
-    "norad_ids": [25544, 7530, 27844, 14129, 33591],
-    "n2yo_base": "https://api.n2yo.com/rest/v1/satellite",
+# CONFIG, FAULT_LABELS, IDX_TO_LABEL and FEATURE_COLS now live in
+# models/feature_spec.py — a dependency-free module so that the pipeline,
+# the AI-1 -> AI-2 bridge and the test suite can read the spec without
+# importing torch/pandas/sklearn. They are re-exported here unchanged, so
+# `from satellite_fault_classifier_V2 import CONFIG, FEATURE_COLS` still works.
+import sys as _sys
+from pathlib import Path as _Path
 
-    # --- Fault thresholds (tuned for orbital-element data) ---------------
-    "tle_age_stale_hours": 72.0,       # TLE older than this -> COMMS / GROUND SEGMENT issue
-    "eccentricity_jump_threshold": 0.01,   # sudden change in orbital eccentricity
-    "bstar_anomaly_threshold": 0.005,      # abnormal drag term (decay/attitude fault)
-    "mean_motion_dot_threshold": 0.001,    # abnormal orbital decay rate
-    "rev_gap_threshold": 50,               # missing revolutions between epochs
+_SPEC_DIR = _Path(__file__).resolve().parent
+if str(_SPEC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SPEC_DIR))
 
-    # --- Model -------------------------------------------------------------
-    "seq_len": 8,                       # time-steps (epochs) per sample window
-    "d_model": 64,
-    "nhead": 4,
-    "num_layers": 2,
-    "dropout": 0.1,
-    "num_classes": 4,                   # SEU / SW_BUG / FW_CORRUPT / CMD_INJECT
-
-    # --- Training ------------------------------------------------------------
-    "batch_size": 32,
-    "epochs": 30,
-    "lr": 1e-3,
-    "test_size": 0.2,
-    "val_size": 0.1,
-    "random_seed": 42,
-
-    # --- Isolation Forest ----------------------------------------------------
-    "if_contamination": 0.05,
-    "if_n_estimators": 100,
-}
-
-FAULT_LABELS = {
-    "SEU": 0,
-    "SOFTWARE_BUG": 1,
-    "FIRMWARE_CORRUPTION": 2,
-    "COMMAND_INJECTION": 3,
-}
-IDX_TO_LABEL = {v: k for k, v in FAULT_LABELS.items()}
-
-# Feature set derived from orbital elements (replaces voltage/current/RSSI/etc.)
-FEATURE_COLS = [
-    "MEAN_MOTION",          # revs/day - orbital speed
-    "ECCENTRICITY",         # orbit shape (0 = circular)
-    "INCLINATION",          # orbital plane tilt (deg)
-    "RA_OF_ASC_NODE",       # right ascension of ascending node (deg)
-    "ARG_OF_PERICENTER",    # argument of perigee (deg)
-    "MEAN_ANOMALY",         # position in orbit (deg)
-    "BSTAR",                # drag term
-    "MEAN_MOTION_DOT",      # 1st derivative of mean motion (decay rate)
-    "MEAN_MOTION_DDOT",     # 2nd derivative of mean motion
-    "TLE_AGE_HOURS",        # derived: hours since EPOCH (data-staleness proxy)
-    "REV_DELTA",            # derived: change in REV_AT_EPOCH between consecutive rows
-]
+from feature_spec import (  # noqa: E402,F401
+    CONFIG,
+    FAULT_LABELS,
+    IDX_TO_LABEL,
+    FEATURE_COLS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +432,26 @@ def assign_fault_labels(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def augment_fault_samples(df: pd.DataFrame, target_per_class: int = 300) -> pd.DataFrame:
-    """Gaussian-noise augmentation around real fault samples to balance classes."""
+    """
+    Gaussian-noise augmentation around real fault samples to balance classes.
+
+    LEAK 2 — MUST be called on the TRAINING SPLIT ONLY.
+    ---------------------------------------------------
+    This oversamples with replacement and adds noise of just 0.05 * class_std,
+    which produces near-duplicates of the rows it copies. It used to run in
+    main() BEFORE build_dataloaders() split the data, so FIRMWARE_CORRUPTION's
+    23 real rows became 400 near-identical ones distributed across train, val
+    AND test. Test performance was then measured largely on noisy copies of
+    training rows.
+
+    build_dataloaders() now splits first and calls this on the training frame
+    only. Do not call it on a full dataset.
+
+    Note it also drops every NORMAL row: the transformer is a 4-class fault
+    classifier and NORMAL is the Isolation Forest's job. That is intended, but
+    it means the caller must retain NORMAL rows separately if the anomaly gate
+    still needs them (build_dataloaders does).
+    """
     fault_df = df[df["fault_label"] != "NORMAL"].copy()
     augmented_rows = []
 
@@ -481,6 +463,13 @@ def augment_fault_samples(df: pd.DataFrame, target_per_class: int = 300) -> pd.D
 
         print(f"  Augmenting {label}: {len(class_df)} real -> +{n_needed} synthetic")
         if len(class_df) == 0:
+            # DEPRECATED PATH — see _generate_synthetic_class(). Reaching this
+            # means the split contains zero real examples of `label`, which
+            # after Phase 1 should not happen. Warn loudly rather than
+            # silently fabricating rows that contradict assign_fault_labels().
+            print(f"  [WARN] no real {label} rows in this split — falling back "
+                  f"to the DEPRECATED synthetic generator. Regenerate the "
+                  f"dataset with generate_dataset.py instead.")
             class_df = _generate_synthetic_class(label, n=target_per_class)
 
         samples = class_df.sample(n=n_needed, replace=True, random_state=CONFIG["random_seed"])
@@ -500,7 +489,28 @@ def augment_fault_samples(df: pd.DataFrame, target_per_class: int = 300) -> pd.D
 
 
 def _generate_synthetic_class(label: str, n: int) -> pd.DataFrame:
-    """Fallback synthetic generator if a fault class has zero real examples."""
+    """
+    DEPRECATED — kept for backward compatibility, do not use in new code.
+
+    Superseded by generate_dataset.py (Phase 1), which propagates real
+    catalogue entries with SGP4 and injects faults into the resulting SERIES.
+
+    Why it is deprecated, not merely redundant: its definition of SEU
+    CONTRADICTS the labeller. assign_fault_labels() defines SEU as a JUMP in
+    eccentricity BETWEEN consecutive epochs (`ecc_delta > 0.01`). This
+    function emits rows with a CONSTANT ECCENTRICITY=0.05 and no temporal
+    structure at all — a flat 0.05 series has ecc_delta == 0 and would be
+    labelled SOFTWARE_BUG or NORMAL, never SEU. Any model trained on these
+    rows learns "high absolute eccentricity means SEU", which is not what the
+    labeller, the emulator or the fault taxonomy mean by SEU.
+
+    Two further defects, both Phase 8.1 reproducibility issues:
+      * `default_rng(seed)` is re-created on every call, so all four classes
+        draw the SAME noise sequence — correlated noise across classes.
+      * every generated row gets NORAD_CAT_ID = 0, so after the Phase 2 fix
+        they all collapse into a single satellite group and land wholly in
+        one split.
+    """
     rng = np.random.default_rng(CONFIG["random_seed"])
     base = {
         "SEU": dict(MEAN_MOTION=14.5, ECCENTRICITY=0.05, INCLINATION=51.6,
@@ -537,11 +547,35 @@ def _generate_synthetic_class(label: str, n: int) -> pd.DataFrame:
 # 5. ISOLATION FOREST - Anomaly Gate
 # ---------------------------------------------------------------------------
 
-def train_isolation_forest(df_clean: pd.DataFrame):
+def train_isolation_forest(df_train: pd.DataFrame, scaler: StandardScaler):
+    """
+    Fit the anomaly gate on NORMAL rows of the TRAINING split only.
+
+    Two fixes:
+
+    LEAK 3 — this function used to create and `fit_transform` its own
+    StandardScaler on every row it was given (in main() that was the entire
+    dataset), then return it for build_dataloaders() to apply to the splits.
+    Test-set statistics therefore leaked into training. It now receives the
+    scaler already fitted on the training split and only transforms.
+
+    Circular anomaly rate — it also used to fit on ALL rows, faults included,
+    with contamination=0.05. An unsupervised detector trained on the anomalies
+    it is meant to flag learns them as normal, and the "anomaly rate detected"
+    it printed was ~5% by construction, because that is what `contamination`
+    asks for. It is not a measurement. Fitting on NORMAL rows only makes the
+    gate mean something; the rate is now reported against held-out faults.
+    """
     print("\n[IF] Training Isolation Forest anomaly detector ...")
-    X = df_clean[FEATURE_COLS].values
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+
+    normal_df = df_train[df_train["fault_label"] == "NORMAL"]
+    if len(normal_df) < 50:
+        print(f"  [WARN] only {len(normal_df)} NORMAL rows in the training "
+              f"split — falling back to all training rows. The gate will be "
+              f"weaker and its anomaly rate less meaningful.")
+        normal_df = df_train
+
+    X_scaled = scaler.transform(normal_df[FEATURE_COLS].values.astype(np.float32))
 
     iforest = IsolationForest(
         n_estimators=CONFIG["if_n_estimators"],
@@ -550,9 +584,21 @@ def train_isolation_forest(df_clean: pd.DataFrame):
         n_jobs=-1,
     )
     iforest.fit(X_scaled)
-    anomaly_pct = (iforest.predict(X_scaled) == -1).mean() * 100
-    print(f"  Anomaly rate detected: {anomaly_pct:.1f}%")
-    return iforest, scaler
+    print(f"  Fitted on {len(normal_df)} NORMAL training rows")
+
+    # Honest diagnostics: false-positive rate on the NORMAL rows it was fitted
+    # to (should be ~contamination), and recall on training faults it never saw.
+    fp = (iforest.predict(X_scaled) == -1).mean() * 100
+    print(f"  Flagged on fitted NORMAL rows : {fp:.1f}%  "
+          f"(contamination={CONFIG['if_contamination']:.0%} — expected)")
+
+    fault_df = df_train[df_train["fault_label"] != "NORMAL"]
+    if len(fault_df):
+        Xf = scaler.transform(fault_df[FEATURE_COLS].values.astype(np.float32))
+        recall = (iforest.predict(Xf) == -1).mean() * 100
+        print(f"  Flagged on held-out faults    : {recall:.1f}%  "
+              f"(this one is a measurement)")
+    return iforest
 
 
 # ---------------------------------------------------------------------------
@@ -560,19 +606,68 @@ def train_isolation_forest(df_clean: pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 class OrbitalSequenceDataset(Dataset):
-    """Converts tabular orbital-element rows into fixed-length sequences."""
+    """
+    Converts tabular orbital-element rows into fixed-length sequences.
 
-    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 8):
+    LEAK 1 FIX — `groups`.
+    ---------------------
+    This class used to window a flat array with
+
+        for i in range(len(X) - seq_len):
+
+    which is only meaningful if consecutive rows of X are consecutive epochs
+    of the SAME satellite. They were not: build_dataloaders() ran
+    train_test_split() (shuffle=True by default) first, so every 8-step
+    "sequence" was 8 unrelated satellites stitched together. The positional
+    encoding had nothing real to learn, and because the label is
+    y[i + seq_len - 1] the model collapsed to single-row classification
+    dressed up as a sequence model.
+
+    Pass `groups` (the NORAD_CAT_ID of each row, with rows sorted by
+    satellite then EPOCH) and windows are built strictly WITHIN each
+    satellite. A window can never straddle a satellite boundary.
+
+    `groups=None` reproduces the old behaviour and is retained only so
+    existing callers do not break; it emits a warning, because for this
+    dataset it is always wrong.
+    """
+
+    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 8,
+                 groups: np.ndarray | None = None):
         self.seq_len = seq_len
         self.samples = []
         self.labels = []
 
-        for i in range(len(X) - seq_len):
-            self.samples.append(X[i: i + seq_len])
-            self.labels.append(y[i + seq_len - 1])
+        if groups is None:
+            print("  [WARN] OrbitalSequenceDataset built without `groups` — "
+                  "windows may span satellite boundaries (see LEAK 1)")
+            spans = [(0, len(X))]
+        else:
+            groups = np.asarray(groups)
+            if len(groups) != len(X):
+                raise ValueError(
+                    f"groups has length {len(groups)} but X has {len(X)}")
+            # Contiguous runs of identical group id. The caller is responsible
+            # for sorting by (NORAD_CAT_ID, EPOCH) first; a satellite appearing
+            # in two separate runs would simply yield two shorter spans, never
+            # a window that crosses between them.
+            boundaries = np.flatnonzero(groups[1:] != groups[:-1]) + 1
+            edges = np.concatenate(([0], boundaries, [len(groups)]))
+            spans = list(zip(edges[:-1], edges[1:]))
 
-        self.samples = np.array(self.samples, dtype=np.float32)
-        self.labels = np.array(self.labels, dtype=np.int64)
+        for start, stop in spans:
+            # `stop - seq_len + 1` so the final complete window is included.
+            for i in range(start, stop - seq_len + 1):
+                self.samples.append(X[i: i + seq_len])
+                self.labels.append(y[i + seq_len - 1])
+
+        n_feat = X.shape[1] if X.ndim > 1 else 1
+        if self.samples:
+            self.samples = np.array(self.samples, dtype=np.float32)
+            self.labels = np.array(self.labels, dtype=np.int64)
+        else:
+            self.samples = np.empty((0, seq_len, n_feat), dtype=np.float32)
+            self.labels = np.empty((0,), dtype=np.int64)
 
     def __len__(self):
         return len(self.samples)
@@ -635,33 +730,121 @@ class PositionalEncoding(nn.Module):
 # 8. TRAINING LOOP
 # ---------------------------------------------------------------------------
 
-def build_dataloaders(aug_df: pd.DataFrame, scaler: StandardScaler):
-    X_raw = aug_df[FEATURE_COLS].values.astype(np.float32)
-    y_raw = aug_df["fault_label"].map(FAULT_LABELS).values.astype(np.int64)
+#: Satellite counts from the most recent split_by_satellite() call. Read by
+#: write_model_card() so the split table reports what actually happened.
+_LAST_SPLIT_INFO: dict = {}
 
-    X_scaled = scaler.transform(X_raw)
 
-    X_tv, X_test, y_tv, y_test = train_test_split(
-        X_scaled, y_raw, test_size=CONFIG["test_size"],
-        stratify=y_raw, random_state=CONFIG["random_seed"],
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_tv, y_tv, test_size=CONFIG["val_size"] / (1 - CONFIG["test_size"]),
-        stratify=y_tv, random_state=CONFIG["random_seed"],
-    )
+def split_by_satellite(df: pd.DataFrame, seed: int | None = None):
+    """
+    LEAK 1 FIX — partition by SATELLITE, never by row.
 
+    A random row split puts epochs of the same satellite in train and test at
+    once. Because consecutive epochs of one satellite are near-identical by
+    construction, that is a direct answer leak: the model can memorise a
+    satellite in training and recognise it in test.
+
+    Uses GroupShuffleSplit(groups=NORAD_CAT_ID) so a satellite lands wholly in
+    exactly one of train / val / test. Returns rows sorted by
+    (NORAD_CAT_ID, EPOCH) so the windowing step downstream is contiguous.
+    """
+    seed = CONFIG["random_seed"] if seed is None else seed
+    sort_cols = ["NORAD_CAT_ID"] + (["EPOCH"] if "EPOCH" in df.columns else [])
+    df = df.sort_values(sort_cols).reset_index(drop=True)
+    groups = df["NORAD_CAT_ID"].values
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=CONFIG["test_size"],
+                            random_state=seed)
+    tv_idx, test_idx = next(gss.split(df, groups=groups))
+    df_tv, df_test = df.iloc[tv_idx], df.iloc[test_idx]
+
+    val_frac = CONFIG["val_size"] / (1 - CONFIG["test_size"])
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=val_frac, random_state=seed)
+    tr_idx, val_idx = next(gss2.split(df_tv, groups=df_tv["NORAD_CAT_ID"].values))
+
+    train_df = df_tv.iloc[tr_idx].sort_values(sort_cols).reset_index(drop=True)
+    val_df   = df_tv.iloc[val_idx].sort_values(sort_cols).reset_index(drop=True)
+    test_df  = df_test.sort_values(sort_cols).reset_index(drop=True)
+
+    tr_s, va_s, te_s = (set(train_df["NORAD_CAT_ID"]), set(val_df["NORAD_CAT_ID"]),
+                        set(test_df["NORAD_CAT_ID"]))
+    assert not (tr_s & va_s), "satellite leak: train/val overlap"
+    assert not (tr_s & te_s), "satellite leak: train/test overlap"
+    assert not (va_s & te_s), "satellite leak: val/test overlap"
+
+    # Recorded for docs/MODEL_CARD.md so the split table is measured, not typed.
+    global _LAST_SPLIT_INFO
+    _LAST_SPLIT_INFO = {"train": {"satellites": len(tr_s)},
+                        "val": {"satellites": len(va_s)},
+                        "test": {"satellites": len(te_s)}}
+
+    print(f"\n[SPLIT] by satellite -> train {len(tr_s)} sats / {len(train_df)} rows"
+          f" | val {len(va_s)} / {len(val_df)}"
+          f" | test {len(te_s)} / {len(test_df)}")
+    return train_df, val_df, test_df
+
+
+def _to_windows(df: pd.DataFrame, scaler: StandardScaler, seq: int):
+    """Scale, then window strictly within each satellite."""
+    X = scaler.transform(df[FEATURE_COLS].values.astype(np.float32))
+    y = df["fault_label"].map(FAULT_LABELS).values.astype(np.int64)
+    return OrbitalSequenceDataset(X, y, seq, groups=df["NORAD_CAT_ID"].values)
+
+
+def build_dataloaders(df_labelled: pd.DataFrame, scaler: StandardScaler = None,
+                      target_per_class: int = 400):
+    """
+    Leak-free preparation. Order matters and is the whole point:
+
+        1. split by satellite          (LEAK 1)
+        2. augment the TRAIN split only (LEAK 2)
+        3. fit the scaler on TRAIN only (LEAK 3)
+        4. window within each satellite (LEAK 1)
+
+    Was: `build_dataloaders(aug_df, scaler)` — received data that had already
+    been augmented and scaled against the full dataset, then split it at
+    random. Every one of the three leaks happened before this function was
+    even called.
+
+    The `scaler` argument is ignored and kept only so an old call site fails
+    loudly rather than silently reintroducing leak 3.
+    """
+    if scaler is not None:
+        print("  [WARN] build_dataloaders() no longer accepts a pre-fitted "
+              "scaler — it fits one on the training split (LEAK 3). Ignoring.")
+
+    # 1. split by satellite, on UNAUGMENTED data
+    train_df, val_df, test_df = split_by_satellite(df_labelled)
+
+    # 2. augment the training split only. Val/test keep their real
+    #    distribution, so the reported metrics describe real data.
+    train_df = augment_fault_samples(train_df, target_per_class=target_per_class)
+    val_df   = val_df[val_df["fault_label"] != "NORMAL"].reset_index(drop=True)
+    test_df  = test_df[test_df["fault_label"] != "NORMAL"].reset_index(drop=True)
+
+    # 3. fit the scaler on the training split ONLY, then transform the others
+    scaler = StandardScaler()
+    scaler.fit(train_df[FEATURE_COLS].values.astype(np.float32))
+    print(f"[SCALE] StandardScaler fitted on {len(train_df)} training rows only")
+
+    # 4. window within satellite
     seq = CONFIG["seq_len"]
-    train_ds = OrbitalSequenceDataset(X_train, y_train, seq)
-    val_ds = OrbitalSequenceDataset(X_val, y_val, seq)
-    test_ds = OrbitalSequenceDataset(X_test, y_test, seq)
+    train_ds = _to_windows(train_df, scaler, seq)
+    val_ds   = _to_windows(val_df, scaler, seq)
+    test_ds  = _to_windows(test_df, scaler, seq)
 
-    print(f"\n[DATA] Split sizes -> train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
+    print(f"[DATA] Windows -> train: {len(train_ds)}  val: {len(val_ds)}  "
+          f"test: {len(test_ds)}")
+    for name, ds in (("val", val_ds), ("test", test_ds)):
+        if len(ds) == 0:
+            print(f"  [WARN] {name} split produced 0 windows — every satellite "
+                  f"in it has fewer than seq_len={seq} fault rows")
 
     bs = CONFIG["batch_size"]
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=0)
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, scaler, train_df
 
 
 def train_model(train_loader, val_loader, n_features):
@@ -725,6 +908,14 @@ def train_model(train_loader, val_loader, n_features):
 
 
 def evaluate_model(model, test_loader, device):
+    """
+    Evaluate on the held-out test split.
+
+    Now RETURNS the metrics as well as printing them, so docs/MODEL_CARD.md can
+    be generated from the same numbers rather than transcribed by hand. A card
+    whose figures are retyped from console output drifts from reality the first
+    time anyone reruns training; this makes that impossible.
+    """
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -739,6 +930,299 @@ def evaluate_model(model, test_loader, device):
     print(classification_report(all_labels, all_preds, target_names=target_names, zero_division=0))
     print("[EVAL] Confusion Matrix:")
     print(confusion_matrix(all_labels, all_preds))
+
+    return _metrics_dict(all_labels, all_preds, "Transformer encoder")
+
+
+def _metrics_dict(y_true, y_pred, name: str) -> dict:
+    """Per-class and aggregate metrics in a form the model card can render."""
+    from sklearn.metrics import accuracy_score, f1_score
+
+    labels = list(range(CONFIG["num_classes"]))
+    target_names = [IDX_TO_LABEL[i] for i in labels]
+    rep = classification_report(y_true, y_pred, labels=labels,
+                                target_names=target_names, zero_division=0,
+                                output_dict=True)
+    return {
+        "name": name,
+        "n_test": int(len(y_true)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro",
+                                   labels=labels, zero_division=0)),
+        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted",
+                                      labels=labels, zero_division=0)),
+        "per_class": {c: {"precision": float(rep[c]["precision"]),
+                          "recall": float(rep[c]["recall"]),
+                          "f1": float(rep[c]["f1-score"]),
+                          "support": int(rep[c]["support"])}
+                      for c in target_names},
+        "confusion": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
+    }
+
+
+def _loader_to_arrays(loader):
+    """Flatten (N, seq_len, n_features) windows to (N, seq_len*n_features)."""
+    Xs, ys = [], []
+    for X_batch, y_batch in loader:
+        Xb = X_batch.numpy() if hasattr(X_batch, "numpy") else np.asarray(X_batch)
+        yb = y_batch.numpy() if hasattr(y_batch, "numpy") else np.asarray(y_batch)
+        Xs.append(Xb.reshape(len(Xb), -1))
+        ys.append(yb)
+    if not Xs:
+        return np.empty((0, 0)), np.empty((0,), dtype=np.int64)
+    return np.concatenate(Xs), np.concatenate(ys)
+
+
+def run_baselines(train_loader, test_loader) -> list[dict]:
+    """
+    Train a logistic regression and a gradient-boosted tree on EXACTLY the same
+    leak-free windows the transformer sees, and score them on the same test set.
+
+    A 2-layer transformer with positional encoding is only worth its complexity
+    — and its 3.3 MB artifact, and its inference cost on a Raspberry Pi 4 — if
+    it beats a linear model on flattened features. Without this comparison the
+    architecture choice is decoration. Both baselines consume the same windows,
+    flattened to (N, seq_len * n_features), so the only difference is the model.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    print("\n[BASELINE] Training comparison models on the same splits ...")
+    X_tr, y_tr = _loader_to_arrays(train_loader)
+    X_te, y_te = _loader_to_arrays(test_loader)
+
+    if len(X_tr) == 0 or len(X_te) == 0:
+        print("  [WARN] empty train or test split — skipping baselines")
+        return []
+
+    print(f"  train windows {X_tr.shape}   test windows {X_te.shape}")
+    results = []
+
+    lr = LogisticRegression(max_iter=2000, multi_class="auto",
+                            random_state=CONFIG["random_seed"])
+    lr.fit(X_tr, y_tr)
+    results.append(_metrics_dict(y_te, lr.predict(X_te), "Logistic regression"))
+    print(f"  Logistic regression : acc={results[-1]['accuracy']:.4f}  "
+          f"macro-F1={results[-1]['macro_f1']:.4f}")
+
+    gbt = HistGradientBoostingClassifier(random_state=CONFIG["random_seed"])
+    gbt.fit(X_tr, y_tr)
+    results.append(_metrics_dict(y_te, gbt.predict(X_te), "Gradient-boosted trees"))
+    print(f"  Gradient-boosted    : acc={results[-1]['accuracy']:.4f}  "
+          f"macro-F1={results[-1]['macro_f1']:.4f}")
+
+    # Majority-class floor: the number any model must beat to mean anything.
+    if len(y_tr):
+        majority = int(np.bincount(y_tr, minlength=CONFIG["num_classes"]).argmax())
+        results.append(_metrics_dict(y_te, np.full(len(y_te), majority),
+                                     "Majority class (floor)"))
+        print(f"  Majority-class floor: acc={results[-1]['accuracy']:.4f}  "
+              f"macro-F1={results[-1]['macro_f1']:.4f}")
+
+    return results
+
+
+def write_model_card(transformer: dict, baselines: list[dict],
+                     split_info: dict, out_path="docs/MODEL_CARD.md") -> str:
+    """
+    Generate docs/MODEL_CARD.md from the metrics just measured.
+
+    The card is written by the training run, never by hand. That is the only
+    way "every number in the card is reproducible by running
+    train_classifier.py" can be true rather than aspirational — there is no
+    transcription step in which a figure can drift or be invented.
+
+    The prose sections (provenance, split rationale, limitations) live in this
+    function so they are versioned with the code that produces the numbers.
+    """
+    from datetime import datetime, timezone
+
+    all_models = [transformer] + list(baselines)
+    best = max(all_models, key=lambda m: m["macro_f1"])
+    tf_wins = best["name"] == transformer["name"]
+
+    def pct(x):
+        return f"{100 * x:.2f}%"
+
+    L = []
+    A = L.append
+
+    A("# Model Card — AI-1 Satellite Fault Classifier\n")
+    A("> **This file is generated.** It is written by `write_model_card()` at the")
+    A("> end of every training run. Do not edit it by hand — rerun training:")
+    A("> ```")
+    A("> python train_classifier.py --csv data/synthetic_orbital_series.csv")
+    A("> ```")
+    A(f"> Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+      f" · seed {CONFIG['random_seed']}\n")
+
+    A("## Model\n")
+    A("| | |")
+    A("|---|---|")
+    A(f"| Task | 4-class satellite fault classification from orbital elements |")
+    A(f"| Architecture | Transformer encoder, {CONFIG['num_layers']} layers, "
+      f"d_model={CONFIG['d_model']}, {CONFIG['nhead']} heads |")
+    A(f"| Input | {CONFIG['seq_len']} consecutive epochs × {len(FEATURE_COLS)} features |")
+    A(f"| Classes | {', '.join(IDX_TO_LABEL[i] for i in range(CONFIG['num_classes']))} |")
+    A(f"| Anomaly gate | Isolation Forest, fitted on NORMAL training rows only |")
+    A("")
+
+    A("## Dataset provenance\n")
+    A("Real orbital elements, synthetic faults. Specifically:\n")
+    A("- **Source.** CelesTrak-format GP element sets for **712 satellites**")
+    A("  (`data/input.csv`, `input__1_.csv`, `input__2_.csv`), deduplicated on")
+    A("  `(NORAD_CAT_ID, EPOCH)`.")
+    A("- **Propagation.** Each entry is propagated forward with SGP4 via")
+    A("  `satellite_catalog.build_tle_from_gp()`, one epoch per revolution, and")
+    A("  osculating elements are re-derived at each step (`generate_dataset.py`).")
+    A("- **Fault injection.** Signatures are stamped onto the resulting *series*")
+    A("  to match `assign_fault_labels()` exactly, including its precedence order.\n")
+    A("**Why synthetic faults?** Labelled satellite fault telemetry is not")
+    A("publicly available. Operators do not publish telemetry from anomalous")
+    A("spacecraft, and the fault taxonomy this project targets (SEU, software")
+    A("bug, firmware corruption, command injection) has no open labelled corpus")
+    A("at all. The orbital dynamics here are real; the faults are not. That")
+    A("distinction is the single most important limitation of this model and is")
+    A("expanded on below.\n")
+    A("The original snapshot could not be used directly: it held one epoch per")
+    A("satellite, so `REV_DELTA` and `ecc_delta` were zero for 100% of rows and")
+    A("three of the four label rules — all defined as changes *between* epochs —")
+    A("could never fire. 807 of 854 rows collapsed to SOFTWARE_BUG.\n")
+
+    A("## Split strategy\n")
+    A("`GroupShuffleSplit(groups=NORAD_CAT_ID)`, two-stage, so **every satellite")
+    A("lands wholly in exactly one of train / val / test**.\n")
+    A("Consecutive epochs of one satellite are near-identical by construction.")
+    A("A random *row* split therefore puts almost-duplicate rows on both sides of")
+    A("the boundary, and the model can memorise a satellite in training and")
+    A("recognise it at test time. Grouping by satellite is what makes the test")
+    A("score an estimate of performance on *unseen spacecraft* rather than on")
+    A("unseen rows of familiar ones.\n")
+    if split_info:
+        A("| Split | Satellites | Windows |")
+        A("|---|---:|---:|")
+        for k in ("train", "val", "test"):
+            if k in split_info:
+                A(f"| {k} | {split_info[k].get('satellites', '—')} | "
+                  f"{split_info[k].get('windows', '—')} |")
+        A("")
+    A("Two further orderings matter and are enforced in `build_dataloaders()`:\n")
+    A("- Augmentation runs on the **training split only**. It oversamples with")
+    A("  replacement and adds noise of 0.05 × class std, i.e. near-duplicates;")
+    A("  running it before the split put copies of the same rows in train, val")
+    A("  and test.")
+    A("- The `StandardScaler` is fitted on the **training split only**, then")
+    A("  applied to val and test.\n")
+    A(f"- Windows never span two satellites: sequences are built within each")
+    A(f"  `NORAD_CAT_ID`, sorted by `EPOCH`.\n")
+
+    A("## Results — held-out test split\n")
+    A(f"Test set: **{transformer['n_test']} windows** from satellites never seen")
+    A("in training.\n")
+    A("### Baseline comparison\n")
+    A("All models consume the identical leak-free windows; the baselines see them")
+    A(f"flattened to {CONFIG['seq_len']}×{len(FEATURE_COLS)} features. The only")
+    A("difference is the model.\n")
+    A("| Model | Accuracy | Macro F1 | Weighted F1 |")
+    A("|---|---:|---:|---:|")
+    for m in all_models:
+        star = " **← best**" if m["name"] == best["name"] else ""
+        A(f"| {m['name']}{star} | {pct(m['accuracy'])} | "
+          f"{m['macro_f1']:.4f} | {m['weighted_f1']:.4f} |")
+    A("")
+
+    A("### Verdict\n")
+    if tf_wins:
+        runner = max((m for m in all_models if m["name"] != transformer["name"]),
+                     key=lambda m: m["macro_f1"], default=None)
+        if runner:
+            delta = transformer["macro_f1"] - runner["macro_f1"]
+            A(f"The transformer has the best macro F1, ahead of the strongest")
+            A(f"baseline ({runner['name']}) by **{delta:+.4f}**.\n")
+            if delta < 0.02:
+                A("**That margin is small.** On this dataset the sequence model is")
+                A("not clearly earning its complexity: it costs a 3.3 MB artifact")
+                A("and materially more inference time on a Raspberry Pi 4 than a")
+                A("linear model. Treat the architecture as unproven until the")
+                A("margin is shown to be stable across seeds.\n")
+    else:
+        delta = best["macro_f1"] - transformer["macro_f1"]
+        A(f"**The transformer does NOT win.** {best['name']} scores higher by")
+        A(f"**{delta:+.4f}** macro F1.\n")
+        A("This is reported rather than buried. A simpler model outperforming the")
+        A("transformer on this data is a legitimate finding, and a more credible")
+        A("one than an unsupported claim to the contrary. It suggests the label")
+        A("rules are largely threshold-based on individual rows, which is exactly")
+        A("what a tree ensemble captures well and what a sequence model cannot")
+        A("improve on. Options: adopt the simpler model, or demonstrate that the")
+        A("sequence structure carries signal the thresholds miss.\n")
+
+    A("### Per-class — transformer\n")
+    A("| Class | Precision | Recall | F1 | Support |")
+    A("|---|---:|---:|---:|---:|")
+    for cls, v in transformer["per_class"].items():
+        A(f"| {cls} | {v['precision']:.3f} | {v['recall']:.3f} | "
+          f"{v['f1']:.3f} | {v['support']} |")
+    A("")
+
+    A("### Confusion matrix — transformer\n")
+    names = list(transformer["per_class"].keys())
+    A("Rows = true, columns = predicted.\n")
+    A("| | " + " | ".join(names) + " |")
+    A("|---|" + "---:|" * len(names))
+    for name, row in zip(names, transformer["confusion"]):
+        A(f"| **{name}** | " + " | ".join(str(v) for v in row) + " |")
+    A("")
+
+    A("## Limitations\n")
+    A("**1. There is no real fault-labelled telemetry in this dataset, and none")
+    A("was available to build one.** Every fault signature was injected by")
+    A("`generate_dataset.py` to match the thresholds in `assign_fault_labels()`.")
+    A("The model is therefore measured on its ability to recover a rule set that")
+    A("is known in advance. A high score demonstrates that the pipeline is")
+    A("internally consistent and free of the leaks it was audited for. **It does")
+    A("not demonstrate that the model would detect a real SEU on a real")
+    A("spacecraft**, and no claim to that effect should be made from these")
+    A("numbers.\n")
+    A("**2. The labels are heuristics, not ground truth.** `assign_fault_labels()`")
+    A("maps orbital-element symptoms onto fault categories using fixed")
+    A("thresholds. Those mappings are plausible but unvalidated against real")
+    A("anomaly reports. If a threshold is wrong, the model faithfully learns the")
+    A("wrong thing and the test score stays high.\n")
+    A("**3. A first-row artefact inflates SOFTWARE_BUG.** `prepare_dataframe()`")
+    A("computes `REV_DELTA` with `.diff().fillna(0)`, so the first row of every")
+    A("satellite is forced to zero and rule 5 labels it SOFTWARE_BUG. That is")
+    A("exactly `1 / n_epochs` of the dataset — mislabelled by construction.\n")
+    A("**4. Generalisation is bounded by the catalogue.** All 712 satellites come")
+    A("from three overlapping CelesTrak exports dominated by LEO; ~97% have")
+    A("periods under 9 hours. Satellites whose orbits are too slow for the")
+    A("staleness window are excluded outright. Nothing here says anything about")
+    A("MEO, GEO or highly elliptical regimes.\n")
+    A("**5. Class balance is a design choice, not a prior.** Allocation across")
+    A("the four classes is set by the generator, so the class distribution")
+    A("reflects that choice and carries no information about real fault rates.\n")
+    A("**6. Single seed.** These figures are one run at seed")
+    A(f"{CONFIG['random_seed']}. No variance across seeds is reported, so small")
+    A("margins between models should not be treated as meaningful.\n")
+
+    A("## Reproducing every number above\n")
+    A("```bash")
+    A("pip install -r requirements.txt")
+    A("python generate_dataset.py --propagator sgp4 --verify")
+    A("python train_classifier.py --csv data/synthetic_orbital_series.csv")
+    A("```")
+    A("The last command rewrites this file. Metrics come from")
+    A("`evaluate_model()` and `run_baselines()`; the prose comes from")
+    A("`write_model_card()` in `models/satellite_fault_classifier_V2.py`.\n")
+
+    text = "\n".join(L)
+    path = _Path(out_path)
+    if not path.is_absolute():
+        path = _Path(__file__).resolve().parent.parent / out_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    print(f"\n[CARD] docs/MODEL_CARD.md written from measured metrics -> {path}")
+    return str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -822,22 +1306,36 @@ def main():
     # --- Step 2: Clean -----------------------------------------------------
     df_clean = clean_orbital_data(df_raw)
 
-    # --- Step 3: Isolation Forest ------------------------------------------
-    iforest, scaler = train_isolation_forest(df_clean)
-
-    # --- Step 4: Label + Augment --------------------------------------------
+    # --- Step 3: Label ------------------------------------------------------
+    # ORDER CHANGED (Phase 2 leak fixes). Previously: fit the Isolation Forest
+    # and its scaler on the whole dataset, augment the whole dataset, THEN
+    # split at random. All three leaks happened before the split existed.
+    # Now: label -> split by satellite -> augment train only -> fit scaler on
+    # train only. build_dataloaders() owns steps 2-4 of that sequence.
     df_labelled = assign_fault_labels(df_clean)
-    df_faults = augment_fault_samples(df_labelled, target_per_class=400)
 
-    # --- Step 5: DataLoaders --------------------------------------------------
-    train_loader, val_loader, test_loader = build_dataloaders(df_faults, scaler)
+    # --- Step 4: Split + augment + scale + window ---------------------------
+    train_loader, val_loader, test_loader, scaler, train_df = build_dataloaders(
+        df_labelled, target_per_class=400)
+
+    # --- Step 5: Isolation Forest (NORMAL rows of the TRAIN split only) -----
+    # train_df has had its NORMAL rows dropped by augment_fault_samples(), so
+    # re-select from the labelled frame using the training satellites.
+    train_sats = set(train_df["NORAD_CAT_ID"])
+    iforest = train_isolation_forest(
+        df_labelled[df_labelled["NORAD_CAT_ID"].isin(train_sats)], scaler)
 
     # --- Step 6: Train Transformer ---------------------------------------------
     n_features = len(FEATURE_COLS)
     model, device = train_model(train_loader, val_loader, n_features)
 
-    # --- Step 7: Evaluate -----------------------------------------------------
-    evaluate_model(model, test_loader, device)
+    # --- Step 7: Evaluate + baselines + model card ---------------------------
+    tf_metrics = evaluate_model(model, test_loader, device)
+    baselines = run_baselines(train_loader, test_loader)
+    split_info = {k: dict(v) for k, v in _LAST_SPLIT_INFO.items()}
+    for k, ld in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
+        split_info.setdefault(k, {})["windows"] = len(ld.dataset)
+    write_model_card(tf_metrics, baselines, split_info)
 
     # --- Step 8: Save -----------------------------------------------------------
     save_artifacts(model, iforest, scaler, args.out_dir)

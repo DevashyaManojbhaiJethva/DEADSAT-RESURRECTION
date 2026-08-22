@@ -21,6 +21,36 @@ build/
 dist/
 *.egg-info/
 
+# ── AI-1 trained artifacts ───────────────────────────────────────────
+# Built on first run, never committed. Produced by:
+#   python generate_dataset.py --propagator sgp4 --verify
+#   python train_classifier.py --csv data/synthetic_orbital_series.csv
+# Loaded by models/classifier_inference.py (transformer_encoder.pt,
+# isolation_forest.pkl, scaler.pkl). ~3.3 MB of binaries that would drift
+# silently from the code that produced them, and are unreviewable in a diff.
+model_artifacts/
+*.pt
+*.pkl
+*.joblib
+
+# ── Crypto runtime output ────────────────────────────────────────────
+# crypto/keygen.py writes these on every CY-1 start, and the ledger/nonce
+# databases are created at runtime. Keys must never be committed.
+crypto/*.bin
+backend/crypto/*.bin
+crypto/*.db
+backend/crypto/*.db
+crypto/nonce_store.db
+ledger.db
+
+# ── Generated datasets ───────────────────────────────────────────────
+# Reproducible offline from the three input CSVs at a fixed seed:
+#   python generate_dataset.py --verify
+data/synthetic_orbital_series.csv
+
+# ── Node ─────────────────────────────────────────────────────────────
+node_modules/
+
 # Jupyter
 .ipynb_checkpoints/
 
