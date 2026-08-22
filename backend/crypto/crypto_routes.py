@@ -128,6 +128,32 @@ def _ensure_init():
         startup_crypto()
 
 
+def rotate_keypair() -> dict:
+    """
+    Rotate the in-process signing keypair.
+
+    Nothing in this codebase runs crypto as a standalone service — it is
+    always mounted in-process via `router` (see the comment block above
+    main.py's /crypto/rotate). Key rotation therefore has to happen HERE,
+    swapping the module-level _keypair, not by asking some other process to
+    do it. Commands signed under the old key are unaffected: /crypto/verify
+    only ever checks against the CURRENT _keypair, exactly like real key
+    rotation invalidates outstanding unverified signatures going forward.
+    """
+    global _keypair
+    _ensure_init()
+    with _key_lock:
+        new_keypair = generate_keypair()
+        _keypair = new_keypair
+    logger.info('Key rotated — fingerprint=%s', new_keypair['key_fingerprint'])
+    print(f'\033[92m[CRYPTO] Key rotated — new fingerprint: '
+          f'{new_keypair["key_fingerprint"]}\033[0m')
+    return {
+        'key_fingerprint': new_keypair['key_fingerprint'],
+        'rotated_at': int(time.time()),
+    }
+
+
 # --- Endpoints ---
 
 def _mock_signing_allowed() -> bool:

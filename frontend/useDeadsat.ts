@@ -10,10 +10,9 @@
  *   links       — connection health for every component (incl. Pi #2 RF)
  *   connected   — is the telemetry WebSocket up?
  *
- * Fallback behaviour: if the backend is unreachable the hook keeps the
- * previous simulated behaviour so the UI still renders, but flags
- * `connected: false` and `simulated: true` so the interface can say so
- * honestly rather than presenting invented numbers as live telemetry.
+ * If the backend is unreachable, the hook retains the last server-provided
+ * state (or explicit zero/offline placeholders before the first frame). It
+ * never manufactures a telemetry stream in the browser.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -29,18 +28,18 @@ import {
 import { SystemLog, TelemetryState } from './types';
 
 const INITIAL_TELEMETRY: TelemetryState = {
-  powerArray: 84.18,
-  adcsPitch: 2.41,
-  adcsYaw: -0.82,
-  adcsStability: 'NOMINAL',
-  commsBandwidth: 1.18,
-  obcCpu: 42,
-  obcMem: 18,
-  altitude: 402.18,
-  velocity: 7.672,
-  lat: 32.51,
-  lng: 122.36,
-  temperature: 291.15,
+  powerArray: 0,
+  adcsPitch: 0,
+  adcsYaw: 0,
+  adcsStability: 'CRITICAL',
+  commsBandwidth: 0,
+  obcCpu: 0,
+  obcMem: 0,
+  altitude: 0,
+  velocity: 0,
+  lat: 0,
+  lng: 0,
+  temperature: 0,
 };
 
 let logSeq = 0;
@@ -170,26 +169,6 @@ export function useDeadsat() {
     });
     return () => sock.close();
   }, [pushLog]);
-
-  // ── Simulation fallback while disconnected ──────────────────────────
-  // Keeps the dashboard alive when the backend is down, but `simulated`
-  // is exposed so the UI can label it instead of passing it off as live.
-  useEffect(() => {
-    if (connected) return;
-    const timer = setInterval(() => {
-      setTelemetry((prev) => ({
-        ...prev,
-        powerArray: Number(
-          Math.min(Math.max(prev.powerArray + (Math.random() - 0.5) * 0.3, 80), 99).toFixed(2),
-        ),
-        obcCpu: Math.min(Math.max(prev.obcCpu + Math.floor((Math.random() - 0.5) * 4), 30), 85),
-        obcMem: Math.min(Math.max(prev.obcMem + Math.floor((Math.random() - 0.5) * 2), 15), 45),
-        lat: Number(((prev.lat + 0.002) % 180).toFixed(4)),
-        lng: Number(((prev.lng + 0.005) % 360).toFixed(4)),
-      }));
-    }, 1200);
-    return () => clearInterval(timer);
-  }, [connected]);
 
   // ── Link health poll ────────────────────────────────────────────────
   useEffect(() => {

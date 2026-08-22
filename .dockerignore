@@ -1,0 +1,40 @@
+# Frontend is not part of this image (backend/AI/crypto only — see
+# docker-compose.yml). Keeping it out of the build context also keeps
+# `docker build` fast: node_modules alone is hundreds of MB.
+frontend/
+
+# VCS / editor
+.git/
+.github/
+.vscode/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local secrets — real .env is passed via docker-compose's env_file, never
+# baked into the image.
+.env
+
+# Logs / recovery output — runtime state, not build input
+*.log
+recovery_logs/
+
+# Test / CI scratch
+.pytest_cache/
+
+# Crypto runtime output — regenerated fresh every process start (keygen.py
+# never loads existing keys from disk), so stale ones from this working
+# copy must not get baked into the image.
+crypto/*.bin
+crypto/*.db
+backend/crypto/*.bin
+backend/crypto/*.db
+
+# Misc
+*.zip
+docs/*.png

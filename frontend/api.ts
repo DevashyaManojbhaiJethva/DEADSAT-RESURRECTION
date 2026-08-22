@@ -35,12 +35,16 @@ function resolveBase(): string {
 export const API_BASE = resolveBase();
 export const WS_BASE = API_BASE.replace(/^http/, 'ws');
 
-/** Optional shared secret — must match DEADSAT_API_KEY on Pi #1. */
-const API_KEY = ((import.meta as any).env?.VITE_API_KEY as string | undefined) ?? '';
+/** JWT lives only in module memory for the active browser session. */
+let sessionToken = '';
+
+export function setSessionToken(token: string | null): void {
+  sessionToken = token ?? '';
+}
 
 function headers(): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (API_KEY) h['X-API-Key'] = API_KEY;
+  if (sessionToken) h.Authorization = `Bearer ${sessionToken}`;
   return h;
 }
 
@@ -80,6 +84,8 @@ export interface TelemetryFrame {
 
   fault_injected: string | null;
   fault_detail: Record<string, unknown>;
+  /** Server-side privacy decision for a historical frame, when requested. */
+  access?: 'FULL' | 'LIMITED' | 'SUMMARY' | 'REDACTED';
 
   overall_health?: string;
 }
@@ -88,7 +94,20 @@ export type BackendFaultType =
   | 'SEU'
   | 'software_bug'
   | 'firmware_corruption'
-  | 'command_injection';
+  | 'command_injection'
+  | 'battery_failure'
+  | 'adcs_failure';
+
+/**
+ * Faults AI-1 cannot classify — it reads orbital elements only, and neither
+ * battery state nor reaction-wheel health leaves a signature in a TLE.
+ * /pipeline/run forces skip_classifier for these, so the reported diagnosis is
+ * the operator's own selection rather than a guess from the wrong four classes.
+ */
+export const CLASSIFIER_BLIND_FAULTS: readonly BackendFaultType[] = [
+  'battery_failure',
+  'adcs_failure',
+] as const;
 
 export interface AgentEvent {
   event: string;
@@ -119,12 +138,35 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export interface LoginResponse {
+  access_token: string;
+  token_type: 'bearer';
+}
+
+/** Authenticate against the backend; credentials and signing never leave it. */
+export async function login(username: string, password: string): Promise<LoginResponse> {
+  const result = await req<LoginResponse>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  });
+  if (result.token_type !== 'bearer' || !result.access_token) throw new Error('Invalid login response');
+  setSessionToken(result.access_token);
+  return result;
+}
+
+async function websocketToken(): Promise<string> {
+  const result = await req<{ connection_token: string; token_type: string }>('/auth/ws-token', { method: 'POST' });
+  if (result.token_type !== 'websocket' || !result.connection_token) throw new Error('Invalid WebSocket token response');
+  return result.connection_token;
+}
+
 export const api = {
   /** Latest telemetry frame (poll fallback when the WebSocket is down). */
   telemetry: () => req<TelemetryFrame>('/telemetry'),
 
   /** Ring-buffer history — the same window AI-1 classifies over. */
-  history: (n = 60) => req<any>(`/telemetry/history?n=${n}`),
+  history: (n = 60, intent = 'monitoring') =>
+    req<any>(`/telemetry/history?n=${n}&intent=${encodeURIComponent(intent)}`),
 
   health: () => req<any>('/health'),
 
@@ -148,6 +190,9 @@ export const api = {
 
   /** Live RTL-SDR power spectrum from Pi #2, proxied through Pi #1. */
   rfSpectrum: () => req<any>('/rf/spectrum'),
+
+  /** RF intelligence analysis from the RF pipeline. */
+  rfIntelligence: () => req<any>('/rf/intelligence'),
 
   /** Inject a fault into the emulator. */
   injectFault: (faultType: BackendFaultType, register = '0x3F') =>
@@ -207,83 +252,240 @@ export interface SocketHandle {
 }
 
 /**
+ * One shared connection per path, fanned out to every subscriber.
+ *
+ * The dashboard opened SIX WebSockets where two would do — three to
+ * /ws/telemetry (useDeadsat, AiDiagnostics, SatelliteDashboard) and three to
+ * /ws/events (useDeadsat, OperatorControlPanel, SatelliteDashboard). Every
+ * frame was serialised by the server and parsed by the browser three times
+ * over, which matters on a Raspberry Pi 4 pushing a frame a second.
+ *
+ * Multiplexing here rather than in a React context keeps subscribeTelemetry()
+ * and subscribeEvents() signature-compatible, so all four components are
+ * untouched. The reconnect logic below is the original, verbatim.
+ */
+interface Channel {
+  ws: WebSocket | null;
+  listeners: Set<(data: any) => void>;
+  statusListeners: Set<(connected: boolean) => void>;
+  connected: boolean;
+  /**
+   * Last `{type:'history'}` envelope seen on this channel.
+   *
+   * Without this, sharing the socket would break the Prompt 6.0 backfill for
+   * any component that mounts AFTER the connection opened — switching to the
+   * dashboard tab, for instance. The envelope arrives once per connect, so a
+   * late subscriber would never see it and its chart would start empty.
+   * Replayed to each new listener instead.
+   */
+  lastHistory: any | null;
+  retry: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  closed: boolean;
+}
+
+const channels = new Map<string, Channel>();
+
+function openChannel(path: string): Channel {
+  const ch: Channel = {
+    ws: null,
+    listeners: new Set(),
+    statusListeners: new Set(),
+    connected: false,
+    lastHistory: null,
+    retry: 0,
+    timer: null,
+    closed: false,
+  };
+
+  const setStatus = (up: boolean) => {
+    ch.connected = up;
+    ch.statusListeners.forEach((fn) => fn(up));
+  };
+
+  const connect = async () => {
+    if (ch.closed) return;
+    try {
+      // Browsers cannot set handshake headers. Exchange the bearer session for
+      // a short-lived, websocket-only token rather than exposing the access JWT.
+      const token = await websocketToken();
+      if (ch.closed) return;
+      ch.ws = new WebSocket(`${WS_BASE}${path}?connection_token=${encodeURIComponent(token)}&intent=monitoring`);
+    } catch {
+      schedule();
+      return;
+    }
+
+    ch.ws.onopen = () => {
+      ch.retry = 0;
+      setStatus(true);
+    };
+
+    ch.ws.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data?.type === 'history') ch.lastHistory = data;
+        ch.listeners.forEach((fn) => fn(data));
+      } catch {
+        /* ignore malformed frame */
+      }
+    };
+
+    ch.ws.onerror = () => ch.ws?.close();
+
+    ch.ws.onclose = () => {
+      // A fresh connection sends a fresh backfill; do not replay a stale one.
+      ch.lastHistory = null;
+      setStatus(false);
+      schedule();
+    };
+  };
+
+  const schedule = () => {
+    if (ch.closed) return;
+    const delay = Math.min(1000 * 2 ** ch.retry, 15000); // 1s -> 15s ceiling
+    ch.retry += 1;
+    ch.timer = setTimeout(connect, delay);
+  };
+
+  connect();
+  return ch;
+}
+
+/**
  * Subscribe to a WebSocket channel with exponential-backoff reconnect.
- * Returns a handle whose `close()` stops reconnecting.
+ * Returns a handle whose `close()` detaches this subscriber; the underlying
+ * socket is torn down once the last subscriber has gone.
  */
 function subscribe<T>(
   path: string,
   onMessage: (data: T) => void,
   onStatus?: (connected: boolean) => void,
 ): SocketHandle {
-  let ws: WebSocket | null = null;
-  let closed = false;
-  let retry = 0;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  let ch = channels.get(path);
+  if (!ch) {
+    ch = openChannel(path);
+    channels.set(path, ch);
+  }
 
-  const connect = () => {
-    if (closed) return;
-    try {
-      // The WebSocket endpoints now enforce DEADSAT_API_KEY (they previously
-      // accepted any connection, so live telemetry was readable by anyone on
-      // the LAN even with the key set). A browser cannot set headers on a
-      // WebSocket handshake, so the key goes in the query string.
-      const auth = API_KEY ? `?api_key=${encodeURIComponent(API_KEY)}` : '';
-      ws = new WebSocket(`${WS_BASE}${path}${auth}`);
-    } catch {
-      schedule();
-      return;
+  const listener = (data: any) => onMessage(data as T);
+  ch.listeners.add(listener);
+  if (onStatus) ch.statusListeners.add(onStatus);
+
+  // Bring the new subscriber up to date with a connection that is already
+  // open: current status, then the backfill it would otherwise have missed.
+  if (ch.connected) {
+    onStatus?.(true);
+    if (ch.lastHistory) {
+      const replay = ch.lastHistory;
+      queueMicrotask(() => listener(replay));
     }
+  }
 
-    ws.onopen = () => {
-      retry = 0;
-      onStatus?.(true);
-    };
-
-    ws.onmessage = (ev) => {
-      try {
-        onMessage(JSON.parse(ev.data) as T);
-      } catch {
-        /* ignore malformed frame */
-      }
-    };
-
-    ws.onerror = () => ws?.close();
-
-    ws.onclose = () => {
-      onStatus?.(false);
-      schedule();
-    };
-  };
-
-  const schedule = () => {
-    if (closed) return;
-    const delay = Math.min(1000 * 2 ** retry, 15000); // 1s -> 15s ceiling
-    retry += 1;
-    timer = setTimeout(connect, delay);
-  };
-
-  connect();
-
+  let detached = false;
   return {
     close: () => {
-      closed = true;
-      if (timer) clearTimeout(timer);
-      ws?.close();
+      if (detached) return;          // close() must be idempotent
+      detached = true;
+      const channel = channels.get(path);
+      if (!channel) return;
+      channel.listeners.delete(listener);
+      if (onStatus) channel.statusListeners.delete(onStatus);
+
+      if (channel.listeners.size === 0 && channel.statusListeners.size === 0) {
+        channel.closed = true;
+        if (channel.timer) clearTimeout(channel.timer);
+        channel.ws?.close();
+        channels.delete(path);
+      }
     },
   };
 }
 
-/** Live telemetry stream — one frame per second from the emulator. */
+/** The backfill envelope /ws/telemetry sends as its FIRST message on connect. */
+export interface TelemetryHistoryMessage {
+  type: 'history';
+  frames: TelemetryFrame[];
+  count: number;
+}
+
+/**
+ * Live telemetry stream — one frame per second from the emulator.
+ *
+ * The first message on this socket is NOT a frame. main.py sends
+ *
+ *     {"type": "history", "frames": [...up to 60...], "count": 60}
+ *
+ * so charts can fill instantly on connect. Nothing checked `type`, so the
+ * envelope was handed to the frame handler on every connect AND every
+ * reconnect. With no telemetry fields on it, consumers rendered
+ * `SP: 0x1FFF00NaN` (Math.round(undefined)), pushed a zeroed point onto the
+ * chart, logged "WS frame undefined", and flashed all five diagnostic
+ * channels red CRITICAL for about a second. The 60 backfilled frames were
+ * then discarded — the feature the envelope exists for had never worked.
+ *
+ * Branching here rather than inside subscribe() fixes all three callers at
+ * once (useDeadsat, AiDiagnostics, SatelliteDashboard) and leaves the generic
+ * helper and its reconnect logic untouched. `onHistory` is optional, so a
+ * caller that does not want the backfill simply no longer receives the
+ * envelope as a frame.
+ */
 export const subscribeTelemetry = (
   onFrame: (f: TelemetryFrame) => void,
   onStatus?: (c: boolean) => void,
-) => subscribe<TelemetryFrame>('/ws/telemetry', onFrame, onStatus);
+  onHistory?: (frames: TelemetryFrame[]) => void,
+) =>
+  subscribe<TelemetryFrame>(
+    '/ws/telemetry',
+    (msg) => {
+      const envelope = msg as unknown as Partial<TelemetryHistoryMessage>;
+      if (envelope?.type === 'history') {
+        onHistory?.(envelope.frames ?? []);
+        return;
+      }
+      onFrame(msg);
+    },
+    onStatus,
+  );
 
 /** Agent/recovery/pipeline event stream. */
 export const subscribeEvents = (
   onEvent: (e: AgentEvent) => void,
   onStatus?: (c: boolean) => void,
 ) => subscribe<AgentEvent>('/ws/events', onEvent, onStatus);
+
+/** RF frame interface from the RF models. */
+export interface RFFrame {
+  timestamp: string;
+  sequence: number;
+  source_node: string;
+  schema_version: string;
+  frequency_hz: number;
+  sample_rate: number;
+  gain: number;
+  signal_dbm: number;
+  snr_db: number;
+  noise_floor_dbm: number;
+  doppler_hz: number;
+  satellite_velocity_ms?: number;
+  spectrum: number[];
+  spectrum_freqs: number[];
+  norad_id?: number;
+  satellite_name?: string;
+  elevation_deg: number;
+  azimuth_deg: number;
+  range_km: number;
+  rf_health: string;
+  mode: string;
+  frame_quality: number;
+  receiving: boolean;
+}
+
+/** RF data stream — live RF frames from Pi #2. */
+export const subscribeRF = (
+  onFrame: (f: RFFrame) => void,
+  onStatus?: (c: boolean) => void,
+) => subscribe<RFFrame>('/ws/rf', onFrame, onStatus);
 
 // ──────────────────────────────────────────────────────────────────────
 // Mapping: backend frame -> the UI's existing TelemetryState shape
@@ -362,9 +564,12 @@ export const UI_FAULT_TO_BACKEND: Record<string, BackendFaultType> = {
   seu: 'SEU',
   leak: 'software_bug',
   injection: 'command_injection',
-  // The emulator has no dedicated battery fault; firmware_corruption is the
-  // one that degrades the power bus, so it is the closest available analogue.
-  battery_fail: 'firmware_corruption',
-  // An ADCS actuator failure presents like an SEU in this emulator.
-  adcs_fail: 'SEU',
+  // FIXED: these two used to be lies. battery_fail mapped to
+  // firmware_corruption and adcs_fail to SEU, "the closest available
+  // analogue" — so selecting either produced a diagnosis and a recovery
+  // procedure contradicting the label the operator had just picked. The
+  // emulator now models both as first-class faults with their own injectors,
+  // per-tick effects and procedures in procedure_library.json.
+  battery_fail: 'battery_failure',
+  adcs_fail: 'adcs_failure',
 };

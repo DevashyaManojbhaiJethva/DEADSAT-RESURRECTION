@@ -1,24 +1,18 @@
 """
-DeadSat Resurrection — RTL-SDR Reader
-Pi #2 module — Meteor-M2-3/4 LRPT Reception
+DEPRECATED: This file is NO LONGER the canonical RTL-SDR implementation.
 
-Receives live LRPT signal from Meteor-M2-3 or Meteor-M2-4
-on 137.900 MHz using RTL-SDR dongle.
+The authoritative RTL-SDR reader is now at: rf/rtlsdr_reader.py
 
-Note: NOAA-18 was decommissioned June 2025.
-      Meteor-M2-3/4 are the active 137 MHz targets in 2026.
+This file is retained for reference only. It contains an older implementation
+with network push functionality that has been superseded by the new RF service
+architecture.
 
-Hardware:
-  - RTL-SDR Blog V3 dongle
-  - Simple wire dipole antenna (53.4cm each arm for 137 MHz)
-  - Raspberry Pi 4 #2
+Migration path:
+- Use rf/rtlsdr_reader.py for RTL-SDR acquisition
+- Use rf/service.py for the RF service on Pi #2
+- The new architecture uses structured RF frames instead of direct network pushes
 
-Dependencies:
-  pip install pyrtlsdr numpy
-  sudo apt-get install rtl-sdr
-
-Usage:
-  python3 rtlsdr_reader.py
+This file will be removed in a future release.
 """
 
 import time

@@ -17,7 +17,6 @@ export default function App() {
   
   // Operator states
   const [operatorId, setOperatorId] = useState<string | null>(null);
-  const [activeProtocol, setActiveProtocol] = useState<'dilithium' | 'rsa' | null>(null);
 
   // Satellite Configurations
   const [satState, setSatState] = useState<SatelliteState>({
@@ -58,11 +57,8 @@ export default function App() {
   } = useDeadsat();
 
   // AI Copilot Messages state
-  const [copilotMessages, setCopilotMessages] = useState<CopilotMessage[]>([
-    { id: '1', timestamp: '14:00:15', text: 'Analyzing attitude telemetry drift...', type: 'info' },
-    { id: '2', timestamp: '14:01:30', text: 'Detected variance in attitude pitch parameters.', type: 'warning' },
-    { id: '3', timestamp: '14:02:45', text: 'Warning: Attitude stabilization coils drawing high current.', type: 'alert' }
-  ]);
+  // Only backend-derived events and authenticated operator actions appear here.
+  const [copilotMessages, setCopilotMessages] = useState<CopilotMessage[]>([]);
 
   // Reflect the live satellite identity from the backend telemetry frame.
   useEffect(() => {
@@ -93,13 +89,12 @@ export default function App() {
   const handlePing = () => { void ping(); };
 
   // Auth gate check success
-  const handleAuthSuccess = (opId: string, protocol: 'dilithium' | 'rsa') => {
+  const handleAuthSuccess = (opId: string) => {
     setOperatorId(opId);
-    setActiveProtocol(protocol);
     setSatState(prev => ({
       ...prev,
       signalLock: true,
-      activeKeyType: protocol === 'dilithium' ? 'DILITHIUM' : 'RSA_VULNERABLE'
+      activeKeyType: 'NONE'
     }));
 
     // Append authorized console log (logs now live in the useDeadsat hook)
@@ -107,7 +102,7 @@ export default function App() {
     pushLog({
       id: Date.now().toString(),
       timestamp: timeStr,
-      message: `ACCESS GRANTED. Operator ${opId} utilizing ${protocol.toUpperCase()}`,
+      message: `ACCESS GRANTED. Backend verified operator ${opId}.`,
       type: 'nominal',
       category: 'security',
     });

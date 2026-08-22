@@ -1,20 +1,20 @@
 """
-DeadSat Resurrection — FastAPI Integration Layer
-AI-2 owned module
+DEPRECATED: This file is NO LONGER the canonical backend.
 
-REST Endpoints:
-  GET  /telemetry          — FE-2 polls every 1s for latest TM frame
-  GET  /telemetry/history  — AI-1 gets sliding window for classifier
-  GET  /contact            — Next ground contact window
-  GET  /health             — Overall satellite health summary
-  POST /fault/inject       — Demo fault injection from dashboard
-  POST /recovery/trigger   — AI-1 calls this when fault is classified
-  POST /recovery/uplink    — Internal: agent notifies backend of uplink
-  POST /reset              — Reset satellite to nominal
+The authoritative FastAPI backend is now at the repository root: main.py
 
-WebSocket Endpoints (FIX 4 & 5):
-  WS   /ws/telemetry       — FE-1 live charts: pushes TM frame every 1s
-  WS   /ws/events          — FE-2 recovery status: pushes agent events in real time
+This file is retained for reference only. It contains an older implementation
+with known issues:
+- Wildcard CORS (*) instead of controlled origins
+- Missing WebSocket authentication 
+- Older security model
+
+Migration path:
+- Use root main.py for all deployments
+- Update any imports from 'backend.main' to 'main'
+- Update any references to backend/main.py in documentation
+
+This file will be removed in a future release.
 """
 
 from dotenv import load_dotenv
@@ -45,7 +45,7 @@ import os
 import config as cfg
 from satellite_emulator import SatelliteEmulator, FaultType, seed_from_real_data
 from real_data_fetcher import RealDataFetcher, NOAA_18_ID
-from crypto_routes import router as crypto_router, startup_crypto, limiter
+from crypto_routes import router as crypto_router, startup_crypto, limiter, rotate_keypair
 
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
@@ -351,6 +351,10 @@ async def inject_fault(req: FaultInjectRequest):
         emulator.inject_firmware_corruption()
     elif ft == "command_injection":
         emulator.inject_command(payload=req.payload or "ROGUE_CMD_0xDEAD")
+    elif ft == "battery_failure":
+        emulator.inject_battery_failure()
+    elif ft == "adcs_failure":
+        emulator.inject_adcs_failure()
     else:
         raise HTTPException(status_code=400, detail=f"Unknown fault type: {req.fault_type}")
 
@@ -695,7 +699,17 @@ async def get_all_baselines():
 
 sys.path.append(str(Path(__file__).parent / "pipeline"))
 
-PIPELINE_FAULT_TYPES = ["SEU", "software_bug", "firmware_corruption", "command_injection"]
+# Faults the pipeline can inject. The first four are also AI-1's classes; the
+# last two are injectable and recoverable but invisible to AI-1, which reads
+# orbital elements only — run_pipeline() forces skip_classifier for those.
+# See pipeline.CLASSIFIER_BLIND_FAULTS.
+PIPELINE_FAULT_TYPES = [
+    "SEU", "software_bug", "firmware_corruption", "command_injection",
+    "battery_failure", "adcs_failure",
+]
+
+#: AI-1's actual output classes — a strict subset of the above.
+CLASSIFIER_FAULT_TYPES = ["SEU", "software_bug", "firmware_corruption", "command_injection"]
 
 
 class PipelineRunRequest(BaseModel):
@@ -875,7 +889,12 @@ async def pipeline_status():
         "artifacts_dir":     str(bridge.artifacts_dir),
         "artifacts_ready":   available,
         "missing_artifacts": bridge.missing_artifacts(),
+        # What the pipeline accepts vs what AI-1 can actually name. Reported
+        # separately so a client cannot assume the classifier covers all six.
         "fault_types":       PIPELINE_FAULT_TYPES,
+        "classifier_fault_types": CLASSIFIER_FAULT_TYPES,
+        "classifier_blind_faults": [f for f in PIPELINE_FAULT_TYPES
+                                    if f not in CLASSIFIER_FAULT_TYPES],
         "seq_len":           CONFIG["seq_len"],
         "feature_cols":      FEATURE_COLS,
         # The dataset step is part of the instruction: training on the raw
@@ -973,19 +992,38 @@ async def pipeline_run(req: PipelineRunRequest):
 @app.post("/crypto/rotate")
 async def crypto_rotate(_auth: None = Depends(require_api_key)):
     """
-    WIRING: ask CY-1 to rotate its signing keypair. Returns an honest failure
-    when CY-1 is offline — the Security Console previously reported a
-    successful rotation after a 2.5 s client-side timer with no service call.
+    Rotate the crypto layer's signing keypair.
+
+    WIRING: this used to unconditionally proxy to CY1_BASE (a standalone
+    CY-1 service on its own host/port) and fail with 503 CY-1 UNREACHABLE
+    whenever nothing answered there — which is EVERY deployment this
+    codebase actually runs, single-machine or Docker included, because
+    crypto is mounted IN-PROCESS via crypto_router (see the comment block
+    above, "Mounting the router makes Pi #1 the crypto authority
+    in-process"). No standalone CY-1 service exists anywhere in this repo.
+    The Security Console's "Rotate Keys" button was therefore permanently
+    broken for every documented setup.
+
+    Now: still try the external CY1_BASE first, for the split two-Pi
+    deployment this endpoint was originally written for if anyone ever
+    stands one up, then fall back to rotating the in-process keypair
+    directly — which is what every actual deployment of this project needs.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.post(f"{cfg.CY1_BASE}/rotate")
             resp.raise_for_status()
-            return {"rotated": True, "detail": resp.json()}
+            return {"rotated": True, "detail": resp.json(), "via": "external_cy1"}
+    except Exception:
+        pass  # no standalone CY-1 reachable — fall through to in-process rotation
+
+    try:
+        detail = rotate_keypair()
+        return {"rotated": True, "detail": detail, "via": "in_process"}
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"CY-1 unavailable at {cfg.CY1_BASE} — key rotation not performed ({e})",
+            detail=f"Key rotation failed — in-process rotation raised: {e}",
         )
 
 # ──────────────────────────────────────────────

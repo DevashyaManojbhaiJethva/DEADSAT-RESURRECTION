@@ -253,9 +253,12 @@ def test_procedure_library():
     with open(lib_path) as f:
         library = json.load(f)
 
-    required = {"SEU", "software_bug", "firmware_corruption", "command_injection"}
+    required = {
+        "SEU", "software_bug", "firmware_corruption", "command_injection",
+        "battery_failure", "adcs_failure",
+    }
     present = set(library["procedures"].keys())
-    check("all 4 fault types present", required == present, f"present={sorted(present)}")
+    check("all 6 fault types present", required == present, f"present={sorted(present)}")
 
     for fault_key, entry in library["procedures"].items():
         priority_list = entry.get("recovery_priority", [])
@@ -295,6 +298,8 @@ def test_procedures_implemented():
         "software_bug": lambda e: e.inject_software_bug(),
         "firmware_corruption": lambda e: e.inject_firmware_corruption(),
         "command_injection": lambda e: e.inject_command(),
+        "battery_failure": lambda e: e.inject_battery_failure(),
+        "adcs_failure": lambda e: e.inject_adcs_failure(),
     }
 
     for name in sorted(proc_to_fault):

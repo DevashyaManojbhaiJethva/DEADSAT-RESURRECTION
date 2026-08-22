@@ -84,9 +84,23 @@ _INJECT_MAP: dict[str, Callable[[SatelliteEmulator], None]] = {
     "software_bug": lambda e: e.inject_software_bug(),
     "firmware_corruption": lambda e: e.inject_firmware_corruption(),
     "command_injection": lambda e: e.inject_command_injection(),
+    "battery_failure": lambda e: e.inject_battery_failure(),
+    "adcs_failure": lambda e: e.inject_adcs_failure(),
 }
 
 FAULT_TYPES: tuple[str, ...] = tuple(_INJECT_MAP.keys())
+
+#: Faults AI-1 CANNOT classify, because it consumes orbital elements only.
+#:
+#: Battery state and reaction-wheel health leave no trace in mean motion,
+#: eccentricity, BSTAR or TLE age — no amount of training would let the model
+#: name them. Running the classifier on one of these would return whichever of
+#: its four classes fit best, reinstating exactly the mismatch this change
+#: removes, just one layer deeper.
+#:
+#: run_pipeline() forces skip_classifier for these: the operator has already
+#: told us the fault type, so the diagnosis matches the label by construction.
+CLASSIFIER_BLIND_FAULTS: frozenset[str] = frozenset({"battery_failure", "adcs_failure"})
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -282,6 +296,14 @@ def run_pipeline(
         raise ValueError(
             f"Unknown fault type {fault_type!r}. Valid: {list(_INJECT_MAP)}"
         )
+
+    # AI-1 cannot see these faults at all — see CLASSIFIER_BLIND_FAULTS. Force
+    # the bypass rather than letting the model guess and report a fault type
+    # that contradicts what the operator injected.
+    if fault_type in CLASSIFIER_BLIND_FAULTS and not skip_classifier:
+        print(f"  Classifier  : FORCED SKIP — {fault_type} has no orbital-element "
+              f"signature; AI-1 classifies from TLE data only")
+        skip_classifier = True
 
     owns_emulator = emulator is None
 

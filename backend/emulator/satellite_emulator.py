@@ -28,6 +28,20 @@ class FaultType(str, Enum):
     SOFTWARE_BUG        = "software_bug"
     FIRMWARE_CORRUPTION = "firmware_corruption"
     COMMAND_INJECTION   = "command_injection"
+    # WIRING: the operator UI has always offered five faults while the emulator
+    # modelled four, so api.ts mapped battery_fail -> firmware_corruption and
+    # adcs_fail -> SEU. Selecting either produced a diagnosis contradicting the
+    # label the operator picked, and the code admitted it in a comment rather
+    # than fixing it. Both are now first-class.
+    #
+    # NOTE these two are deliberately absent from AI-1's FAULT_LABELS. AI-1
+    # classifies from ORBITAL ELEMENTS (mean motion, eccentricity, BSTAR, TLE
+    # age...). Battery state and reaction-wheel health leave no signature in a
+    # TLE, so no amount of training would let it name them. They are injected
+    # and recovered with the fault type known up front — see
+    # PIPELINE_SKIP_CLASSIFIER_FAULTS in pipeline.py.
+    BATTERY_FAILURE     = "battery_failure"
+    ADCS_FAILURE        = "adcs_failure"
 
 
 # ──────────────────────────────────────────────
@@ -401,6 +415,33 @@ class SatelliteEmulator:
             self.power.solar_output_w    = _clamp(
                 self.power.solar_output_w - random.uniform(2, 5), "power_w", True)
 
+        elif self.fault_injected == FaultType.BATTERY_FAILURE:
+            # Capacity collapse: charge drains and the bus sags with it. Both
+            # saturate at their physical floors rather than running away —
+            # same discipline as every other fault effect (Prompt 3.3).
+            self.power.battery_pct    = _clamp(
+                self.power.battery_pct - random.uniform(0.4, 1.2), "battery_pct", True)
+            self.power.bus_voltage_v  = _clamp(
+                self.power.bus_voltage_v - random.uniform(0.1, 0.3), "bus_voltage_v", True)
+            self.power.charging       = False
+            self.power.status         = "fault"
+            # An undervolting bus eventually browns out the OBC.
+            if self.power.bus_voltage_v < 24.0:
+                self.obc.status       = "degraded"
+
+        elif self.fault_injected == FaultType.ADCS_FAILURE:
+            # Dead actuator: the wheel is stopped and cannot desaturate, so
+            # body rate and pointing error grow. Note obc.error_count does NOT
+            # increase — that is what separates this from an SEU.
+            self.adcs.reaction_wheel_rpm = 0.0
+            self.adcs.rate_deg_s         = _clamp(
+                self.adcs.rate_deg_s + random.uniform(0.02, 0.08),
+                "adcs_rate_deg_s", True)
+            self.adcs.pointing_error_deg = _clamp(
+                self.adcs.pointing_error_deg + random.uniform(0.2, 0.8),
+                "adcs_pointing_err_deg", True)
+            self.adcs.status             = "fault"
+
     def _build_frame(self) -> dict:
         """Build the canonical JSON telemetry frame shared with all team members."""
         return {
@@ -519,6 +560,46 @@ class SatelliteEmulator:
             }
         print(f"[Emulator] FAULT INJECTED: Rogue Command → {payload}")
 
+    def inject_battery_failure(self, cell: str = "CELL_3"):
+        """
+        Battery cell failure — capacity collapses and the bus browns out.
+
+        Distinct from firmware_corruption (which degrades the whole platform):
+        this is a power-subsystem hardware fault. OBC, ADCS and comms stay
+        nominal until the bus voltage sags, which is what makes it separable
+        from the fault it used to be mapped onto.
+        """
+        with self._lock:
+            self.fault_injected      = FaultType.BATTERY_FAILURE
+            self.power.charging      = False
+            self.power.status        = "fault"
+            self.fault_detail        = {
+                "subsystem": "power",
+                "cell":      cell,
+                "symptom":   "capacity collapse, bus undervoltage",
+            }
+        print(f"[Emulator] FAULT INJECTED: Battery Failure → {cell}")
+
+    def inject_adcs_failure(self, wheel: str = "RW_Y"):
+        """
+        Reaction-wheel failure — attitude control is lost mechanically.
+
+        Distinct from an SEU: an SEU is a transient bit-flip in the OBC's
+        state vector that a memory scrub clears. This is a dead actuator, so
+        the wheel speed decays to zero and pointing error grows without the
+        OBC reporting any error count.
+        """
+        with self._lock:
+            self.fault_injected           = FaultType.ADCS_FAILURE
+            self.adcs.status              = "fault"
+            self.adcs.reaction_wheel_rpm  = 0.0
+            self.fault_detail             = {
+                "subsystem": "adcs",
+                "wheel":     wheel,
+                "symptom":   "reaction wheel stalled, attitude drifting",
+            }
+        print(f"[Emulator] FAULT INJECTED: ADCS Actuator Failure → {wheel}")
+
     def inject_command_injection(self, payload: str = "ROGUE_CMD_0xDEAD"):
         """
         PIPELINE ALIAS for inject_command().
@@ -635,6 +716,41 @@ class SatelliteEmulator:
             elif procedure_name == "COMMS_HARD_RESET_v1":
                 # FIX 8: Full comms subsystem power cycle
                 self.comms                  = CommsState()
+
+            elif procedure_name == "BATTERY_CELL_ISOLATE_v1":
+                # Isolate the failed cell and fall back to the remaining string.
+                # Capacity is reduced but the bus is stable — recovery here means
+                # "safe and stable", not "as new", which is why the success
+                # criteria ask for a healthy bus rather than a full battery.
+                self.power.charging      = True
+                self.power.bus_voltage_v = 28.0
+                self.power.battery_pct   = max(self.power.battery_pct, 55.0)
+                self.power.status        = "nominal"
+                self.obc.status          = "nominal"
+
+            elif procedure_name == "POWER_SAFE_MODE_v1":
+                # Shed non-essential loads: keep the beacon and the bus alive.
+                self.power.charging      = True
+                self.power.bus_voltage_v = max(self.power.bus_voltage_v, 26.5)
+                self.power.status        = "degraded"
+                self.comms.beacon_active = True
+                self.comms.downlink_active = False
+
+            elif procedure_name == "ADCS_WHEEL_RESTART_v1":
+                # Attempt to spin the stalled wheel back up.
+                self.adcs.reaction_wheel_rpm = 4800.0
+                self.adcs.rate_deg_s         = 0.003
+                self.adcs.pointing_error_deg = 0.001
+                self.adcs.status             = "nominal"
+
+            elif procedure_name == "ADCS_MAGNETORQUER_FALLBACK_v1":
+                # Wheel is gone for good — hold attitude on magnetorquers.
+                # Coarser than wheel control, so pointing error settles at a
+                # higher value than ADCS_WHEEL_RESTART_v1 achieves.
+                self.adcs.reaction_wheel_rpm = 0.0
+                self.adcs.rate_deg_s         = 0.008
+                self.adcs.pointing_error_deg = 0.4
+                self.adcs.status             = "degraded"
 
             else:
                 # Unreachable: PROCEDURE_APPLICABILITY is keyed by the same

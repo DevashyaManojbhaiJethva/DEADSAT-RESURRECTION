@@ -17,9 +17,12 @@ def red(msg):    print(f"\033[91m{msg}\033[0m")
 
 METEOR_M2_4_NORAD = 59051
 METEOR_M2_3_NORAD = 57166
-GROUND_LAT        = 23.03
-GROUND_LON        = 72.58
-GROUND_ELEV_M     = 53
+# Default ground station location (Ahmedabad) - can be overridden via environment
+RF_LOCATION_LAT   = float(os.environ.get("RF_LOCATION_LAT", os.environ.get("GROUND_LAT", "23.03")))
+RF_LOCATION_LON   = float(os.environ.get("RF_LOCATION_LON", os.environ.get("GROUND_LON", "72.58")))
+GROUND_LAT        = RF_LOCATION_LAT
+GROUND_LON        = RF_LOCATION_LON
+GROUND_ELEV_M     = float(os.environ.get("GROUND_ELEV_M", "53"))
 FREQUENCY_MHZ     = 137.9
 SPEED_OF_LIGHT    = 299_792_458.0
 MIN_ELEVATION_DEG = 10.0
@@ -254,11 +257,19 @@ def _eci_to_azel(pos_km, ground_lat_deg, ground_lon_deg, elev_m, jd, fr):
 
 # ── Pass scanner (core engine) ────────────────────────────────────────────────
 
-def _scan_passes(sat, hours: int) -> list:
+def _scan_passes(sat, hours: int, ground_lat: float = GROUND_LAT, 
+                 ground_lon: float = GROUND_LON, ground_elev_m: float = GROUND_ELEV_M) -> list:
     """
     Scan the next N hours and return a list of all passes.
     Each pass is a dict with aos, los, max_elevation_deg, duration_min,
     pass_quality, aos_ist, los_ist, aos_timestamp, los_timestamp.
+    
+    Args:
+        sat: SGP4 satellite object
+        hours: Number of hours to scan ahead
+        ground_lat: Ground station latitude in degrees
+        ground_lon: Ground station longitude in degrees
+        ground_elev_m: Ground station elevation in meters
     """
     now   = datetime.now(timezone.utc)
     end   = now + timedelta(hours=hours)
@@ -275,7 +286,7 @@ def _scan_passes(sat, hours: int) -> list:
         jd, fr      = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
         e, pos, vel = sat.sgp4(jd, fr)
         if e == 0:
-            az, el, rng = _eci_to_azel(pos, GROUND_LAT, GROUND_LON, GROUND_ELEV_M, jd, fr)
+            az, el, rng = _eci_to_azel(pos, ground_lat, ground_lon, ground_elev_m, jd, fr)
             if el >= MIN_ELEVATION_DEG:
                 if not in_pass:
                     in_pass = True
@@ -318,10 +329,27 @@ def _pass_quality(max_el: float) -> str:
 
 class MeteorPredictor:
 
-    def __init__(self, norad: int = METEOR_M2_4_NORAD):
+    def __init__(self, norad: int = METEOR_M2_4_NORAD, 
+                 ground_lat: float = GROUND_LAT, 
+                 ground_lon: float = GROUND_LON,
+                 ground_elev_m: float = GROUND_ELEV_M):
+        """
+        Initialize satellite predictor with configurable ground station.
+        
+        Args:
+            norad: NORAD catalog ID for target satellite
+            ground_lat: Ground station latitude in degrees
+            ground_lon: Ground station longitude in degrees  
+            ground_elev_m: Ground station elevation in meters
+        """
         self.norad      = norad
         self.frequency  = FREQUENCY_MHZ
         self.sat_name   = "Meteor-M2-4" if norad == METEOR_M2_4_NORAD else "Meteor-M2-3"
+        
+        # Store ground station location
+        self.ground_lat = ground_lat
+        self.ground_lon = ground_lon
+        self.ground_elev_m = ground_elev_m
 
         l1, l2, src     = fetch_best_tle(norad)
         self._tle_line1  = l1
@@ -329,13 +357,14 @@ class MeteorPredictor:
         self._tle_source = src
         self._sat        = Satrec.twoline2rv(l1, l2)
         green(f"[PREDICTOR] {self.sat_name} loaded — source: {src}")
+        green(f"[PREDICTOR] Ground station: {ground_lat}°N, {ground_lon}°E, {ground_elev_m}m")
 
     def _position_now(self):
         jd, fr = _jday_now()
         e, pos, vel = self._sat.sgp4(jd, fr)
         if e != 0:
             raise RuntimeError(f"sgp4 error code {e}")
-        az, el, rng = _eci_to_azel(pos, GROUND_LAT, GROUND_LON, GROUND_ELEV_M, jd, fr)
+        az, el, rng = _eci_to_azel(pos, self.ground_lat, self.ground_lon, self.ground_elev_m, jd, fr)
         return az, el, rng, pos, vel
 
     def get_current_position(self) -> dict:
@@ -367,8 +396,8 @@ class MeteorPredictor:
         return _pass_quality(max_elevation_deg)
 
     def get_all_passes(self, hours: int = SEARCH_WINDOW_H) -> list:
-        """Returns all passes over Ahmedabad in the next N hours."""
-        return _scan_passes(self._sat, hours)
+        """Returns all passes over ground station in the next N hours."""
+        return _scan_passes(self._sat, hours, self.ground_lat, self.ground_lon, self.ground_elev_m)
 
     def get_next_pass(self) -> dict:
         """Returns the next single pass."""
@@ -423,10 +452,14 @@ class MeteorPredictor:
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  Meteor-M2-4 Pass Predictor — DeadSat Ground Station")
-    print("  Ahmedabad  23.03°N  72.58°E  53m ASL")
+    print(f"  Ground Station  {GROUND_LAT}°N  {GROUND_LON}°E  {GROUND_ELEV_M}m ASL")
     print("=" * 60 + "\n")
 
-    predictor = MeteorPredictor()
+    predictor = MeteorPredictor(
+        ground_lat=GROUND_LAT,
+        ground_lon=GROUND_LON,
+        ground_elev_m=GROUND_ELEV_M
+    )
 
     print("\n--- TLE Source ---")
     green(f"Source : {predictor._tle_source}")

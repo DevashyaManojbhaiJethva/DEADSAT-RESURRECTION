@@ -40,14 +40,20 @@ export default function SecurityConsole() {
         setLastError(e.message);
       }
 
+      // WIRING: /crypto/ledger and /crypto/alerts are now served by the real
+      // crypto router, which returns a BARE ARRAY. These parsed `l.entries` /
+      // `a.alerts` — the shape of the hand-rolled proxy handlers that Prompt
+      // 4.0 removed — so both have been silently empty ever since, which is
+      // indistinguishable from "no commands have been signed".
+      // Accept either shape so the panel works against both trees.
       try {
         const l: any = await api.cryptoLedger();
-        if (alive) setLedger(Array.isArray(l.entries) ? l.entries : []);
-      } catch { if (alive) setLedger([]); }
+        if (alive) setLedger(Array.isArray(l) ? l : (Array.isArray(l?.entries) ? l.entries : []));
+      } catch (e: any) { if (alive) { setLedger([]); setLastError(e.message); } }
 
       try {
         const a: any = await api.cryptoAlerts();
-        if (alive) setAlerts(Array.isArray(a.alerts) ? a.alerts : []);
+        if (alive) setAlerts(Array.isArray(a) ? a : (Array.isArray(a?.alerts) ? a.alerts : []));
       } catch { if (alive) setAlerts([]); }
 
       try {
@@ -113,6 +119,34 @@ export default function SecurityConsole() {
                   : `PQC STATUS: ${(cryptoMode || 'UNVERIFIED').toUpperCase().replace('_', ' ')}`}
             </span>
           </div>
+
+          {/* Live crypto-layer state. cryptoMode and lastError were fetched
+              every 5 s and never rendered, so a CY-1 outage or a mocked
+              backend looked identical to a healthy one. */}
+          <div className="flex flex-wrap items-center gap-2 mb-4 font-mono text-[10px] uppercase tracking-wider">
+            <span className="text-[#D4D4D4]/60">MODE:</span>
+            <span className={cyOnline ? 'text-signal-green font-bold' : 'text-threat-red font-bold'}>
+              {cryptoMode}
+            </span>
+            {verifyGate !== null && (
+              <>
+                <span className="text-[#D4D4D4]/30">·</span>
+                <span className="text-[#D4D4D4]/60">VERIFY GATE:</span>
+                <span className={verifyGate ? 'text-signal-green font-bold' : 'text-threat-red font-bold'}>
+                  {verifyGate ? 'ON' : 'OFF'}
+                </span>
+              </>
+            )}
+            <span className="text-[#D4D4D4]/30">·</span>
+            <span className="text-[#D4D4D4]/60">LEDGER:</span>
+            <span className="text-data-blue font-bold">{ledger.length} SIGNED</span>
+          </div>
+
+          {lastError && (
+            <div className="mb-4 px-3 py-2 border border-threat-red/35 bg-threat-red/10 rounded-sm font-mono text-[10px] text-threat-red leading-relaxed">
+              CY-1 UNREACHABLE — {lastError}
+            </div>
+          )}
 
           <p className="text-sm text-[#D4D4D4] leading-relaxed mb-6">
             Civilian satellite lanes rely heavily on older RSA asymmetric signatures. Quantum Shor solvers can crack normal RSA sub-keys in linear times. Implementing CRYSTALS-Dilithium secures critical command uplink modules through multi-dimensional modular lattices.
@@ -231,12 +265,53 @@ export default function SecurityConsole() {
               <Warning className="w-5 h-5 text-threat-red mt-0.5 shrink-0 animate-pulse" />
             )}
             <p className="text-[#D4D4D4]/80 leading-relaxed">
-              {activeKey === 'DILITHIUM' 
+              {activeKey === 'DILITHIUM'
                 ? "Secure socket keys are post-quantum hardened. Ground station signatures cannot be falsified by Shor solvers."
                 : "Active RSA keys can be pre-cached by state-level attackers. Upgrade signature lanes to CRYSTALS immediately."}
             </p>
           </div>
         </div>
+
+        {/* SIGNED COMMAND LEDGER — the single best evidence the security layer
+            works. Already fetched from /crypto/ledger every 5 s and, until now,
+            thrown away. */}
+        <h3 className="text-xs font-bold text-white uppercase tracking-wider border-b border-white/10 pb-3 mb-4 mt-6">
+          SIGNED COMMAND LEDGER
+        </h3>
+
+        {ledger.length === 0 ? (
+          <div className="text-[10px] text-[#D4D4D4]/40 leading-relaxed">
+            {cyOnline === false
+              ? 'CY-1 offline — no signatures can be issued or recorded.'
+              : 'No commands signed yet. The ledger fills when a recovery uplinks.'}
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            {ledger.slice(-6).reverse().map((row: any) => (
+              <div
+                key={row.id}
+                className="bg-[#0D0D0D]/80 border border-white/10 px-2.5 py-1.5 rounded-sm text-[9px] leading-relaxed"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-signal-green font-bold">#{row.id}</span>
+                  <span className="text-[#D4D4D4]/50">{row.timestamp}</span>
+                </div>
+                <div className="flex items-center justify-between gap-2 mt-0.5">
+                  <span className="text-data-blue truncate select-all" title={row.cmd_hash}>
+                    {String(row.cmd_hash ?? '').slice(0, 24)}…
+                  </span>
+                  <span className="text-[#D4D4D4]/60 uppercase shrink-0">{row.operator ?? '—'}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {alerts.length > 0 && (
+          <div className="mt-4 px-2.5 py-2 border border-threat-red/35 bg-threat-red/10 rounded-sm text-[9px] text-threat-red leading-relaxed">
+            {alerts.length} ROGUE-COMMAND ALERT{alerts.length > 1 ? 'S' : ''} — {alerts[0]?.alert_type ?? 'see /crypto/alerts'}
+          </div>
+        )}
       </div>
 
     </div>

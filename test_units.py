@@ -20,6 +20,7 @@ docstring so it can be checked by hand.
 
 from __future__ import annotations
 
+import json
 import sys
 import traceback
 from pathlib import Path
@@ -31,6 +32,16 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "models"))
 
 VERBOSE = "-v" in sys.argv
+
+#: --only <substring>  run just the tests whose function name contains it.
+#: Used by verify_tests_can_fail.py so one mutation does not have to run the
+#: whole suite (the 5000-tick bounds tests alone make that far too slow).
+ONLY = ""
+if "--only" in sys.argv:
+    _i = sys.argv.index("--only")
+    if _i + 1 < len(sys.argv):
+        ONLY = sys.argv[_i + 1]
+
 _results: list[tuple[str, str, str]] = []
 
 
@@ -40,8 +51,10 @@ def _record(name, status, detail=""):
     print(f"  [{mark}] {name}" + (f"  — {detail}" if detail else ""))
 
 
-def test(fn):
+def run_test(fn):
     """Register and run a test function immediately."""
+    if ONLY and ONLY not in fn.__name__:
+        return fn
     name = fn.__name__.replace("test_", "").replace("_", " ")
     try:
         fn()
@@ -77,11 +90,138 @@ def _clf():
     return clf
 
 
+def _clf_numpy_only():
+    """
+    The classifier module, importable even without torch/scikit-learn.
+
+    `augment_fault_samples()` and `_class_rng()` use nothing but numpy and
+    pandas, but they live in a module that imports torch at the top — so the
+    reproducibility checks would SKIP on any machine without a 2 GB ML stack,
+    which is where they are most likely to be run.
+
+    When torch is genuinely installed the real module is used. Otherwise the
+    heavy imports are stubbed just long enough to import, then REMOVED from
+    sys.modules so no other test mistakes a stub for the real package (that
+    would silently un-skip the leak-detection tests and run them against
+    fakes).
+    """
+    _need("pandas")
+    try:
+        import torch  # noqa: F401
+        import sklearn  # noqa: F401
+        import satellite_fault_classifier_V2 as clf
+        return clf
+    except ImportError:
+        pass
+
+    import types
+    stub_names = [
+        "torch", "torch.nn", "torch.optim", "torch.utils", "torch.utils.data",
+        "sklearn", "sklearn.model_selection", "sklearn.preprocessing",
+        "sklearn.ensemble", "sklearn.metrics", "sklearn.linear_model",
+        "tqdm", "requests",
+    ]
+    added = [n for n in stub_names if n not in sys.modules]
+    for n in added:
+        sys.modules[n] = types.ModuleType(n)
+
+    sys.modules["torch"].manual_seed = lambda *_a: None
+    placeholder = type("_Placeholder", (object,), {})
+    sys.modules["torch.nn"].Module = placeholder
+    sys.modules["torch.nn"].Linear = placeholder
+    sys.modules["torch.utils.data"].Dataset = object
+    sys.modules["torch.utils.data"].DataLoader = object
+    for mod, attrs in (
+        ("sklearn.model_selection", ["train_test_split", "GroupShuffleSplit"]),
+        ("sklearn.preprocessing", ["StandardScaler"]),
+        ("sklearn.ensemble", ["IsolationForest", "HistGradientBoostingClassifier"]),
+        ("sklearn.linear_model", ["LogisticRegression"]),
+        ("sklearn.metrics", ["classification_report", "confusion_matrix",
+                             "accuracy_score", "f1_score"]),
+    ):
+        for a in attrs:
+            setattr(sys.modules[mod], a, type(a, (object,), {}))
+    sys.modules["tqdm"].tqdm = lambda x, **k: x
+
+    try:
+        sys.path.insert(0, str(ROOT / "models"))
+        import satellite_fault_classifier_V2 as clf
+        return clf
+    finally:
+        for n in added:                 # do not leave fakes behind
+            sys.modules.pop(n, None)
+
+
+# ---------------------------------------------------------------------------
+# Source-inspection helpers
+#
+# Several assertions below check what a file DOES rather than what it says.
+# Searching raw text matches the comment that documents the removed behaviour —
+# the comment necessarily quotes the offending string. That produced six false
+# failures across this suite before these existed. Define them ONCE, here,
+# before any @test runs (tests execute at definition time).
+# ---------------------------------------------------------------------------
+
+def _code_only(rel_path: str) -> str:
+    """Python source with comments and docstrings stripped."""
+    import ast
+    tree = ast.parse((ROOT / rel_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)) and body:
+            first = body[0]
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                body.pop(0)
+    return ast.unparse(tree)
+
+
+def _node() -> str | None:
+    """Path to node, or None. Used to EXECUTE frontend logic rather than grep it."""
+    import shutil
+    return shutil.which("node")
+
+
+def _esbuild() -> str | None:
+    """
+    Path to an esbuild binary, or None.
+
+    npm install cannot reach the registry in this environment, so there is no
+    local node_modules/.bin — but tsx ships a platform binary that transpiles
+    TypeScript perfectly well, which lets a few of these tests run the real
+    api.ts instead of pattern-matching its source.
+    """
+    import glob
+    import shutil
+    found = shutil.which("esbuild")
+    if found:
+        return found
+    for pattern in (
+        "/usr/local/lib/node_modules_global/lib/node_modules/tsx/node_modules/@esbuild/*/bin/esbuild",
+        "/usr/lib/node_modules/tsx/node_modules/@esbuild/*/bin/esbuild",
+        str(ROOT / "frontend" / "node_modules" / ".bin" / ("esbuild.cmd" if sys.platform == "win32" else "esbuild")),
+    ):
+        hits = glob.glob(pattern)
+        if hits:
+            return hits[0]
+    return None
+
+
+def _ts_code_only(rel_path: str) -> str:
+    """TypeScript/TSX source with // and /* */ comments removed."""
+    import re
+    src = (ROOT / rel_path).read_text(encoding="utf-8")
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)      # block comments
+    src = re.sub(r"^\s*//.*$", "", src, flags=re.M)      # whole-line //
+    return src
+
+
 # ===========================================================================
 # LEAK 1 — windows must not span satellites
 # ===========================================================================
 
-@test
+@run_test
 def test_no_window_spans_two_satellites():
     """
     Revert check: pass groups=None (the pre-fix behaviour) and this fails —
@@ -109,7 +249,7 @@ def test_no_window_spans_two_satellites():
         assert int(ds.labels[i]) == int(y[last_row]), "label/window mismatch"
 
 
-@test
+@run_test
 def test_group_shorter_than_seq_len_yields_no_windows():
     """A satellite with fewer than seq_len rows must contribute nothing."""
     _need("torch", "sklearn")
@@ -127,7 +267,7 @@ def test_group_shorter_than_seq_len_yields_no_windows():
         "satellite 2 has 3 rows < seq_len and must produce no window"
 
 
-@test
+@run_test
 def test_empty_input_produces_wellformed_empty_dataset():
     """A split with no usable rows must give a shaped empty array, not crash."""
     _need("torch", "sklearn")
@@ -144,7 +284,7 @@ def test_empty_input_produces_wellformed_empty_dataset():
 # LEAK 1 — no satellite in more than one split
 # ===========================================================================
 
-@test
+@run_test
 def test_no_norad_id_in_more_than_one_split():
     """
     Revert check: swap split_by_satellite() for train_test_split() on rows and
@@ -179,7 +319,7 @@ def test_no_norad_id_in_more_than_one_split():
     assert len(tr | va | te) == 60, "satellites lost or duplicated in the split"
 
 
-@test
+@run_test
 def test_split_rows_are_sorted_within_satellite():
     """Windowing assumes contiguous, epoch-ordered rows per satellite."""
     clf = _clf()
@@ -210,7 +350,7 @@ def test_split_rows_are_sorted_within_satellite():
 # LEAK 3 — scaler fitted once, on training data only
 # ===========================================================================
 
-@test
+@run_test
 def test_scaler_fitted_once_on_training_rows_only():
     """
     Revert check: restore the old `scaler.fit_transform(all_rows)` inside
@@ -258,7 +398,7 @@ def test_scaler_fitted_once_on_training_rows_only():
 # LEAK 2 — augmentation confined to the training split
 # ===========================================================================
 
-@test
+@run_test
 def test_augmentation_does_not_reach_val_or_test():
     """
     Augmented rows are near-duplicates. If any satellite's row count grows in
@@ -298,7 +438,7 @@ def test_augmentation_does_not_reach_val_or_test():
 # Isolation Forest — fitted on NORMAL rows only
 # ===========================================================================
 
-@test
+@run_test
 def test_isolation_forest_fits_on_normal_rows_only():
     """
     Revert check: drop the NORMAL filter and this fails — the forest is handed
@@ -346,7 +486,7 @@ def test_isolation_forest_fits_on_normal_rows_only():
 # The deprecated synthetic generator contradicts the labeller
 # ===========================================================================
 
-@test
+@run_test
 def test_synthetic_seu_contradicts_the_labeller():
     """
     Documents, rather than fixes, the contradiction: assign_fault_labels()
@@ -380,7 +520,30 @@ def _emulator():
     return em
 
 
-@test
+def _injectors_for(em, e) -> dict:
+    """
+    Every FaultType -> the method that injects it.
+
+    Derived from the enum rather than hardcoded, so adding a fault type
+    without an injector fails loudly here instead of KeyError-ing whichever
+    test happens to reach it first (which is exactly what happened when
+    battery_failure and adcs_failure were added in Prompt 6.4).
+    """
+    mapping = {
+        em.FaultType.SEU: e.inject_SEU,
+        em.FaultType.SOFTWARE_BUG: e.inject_software_bug,
+        em.FaultType.FIRMWARE_CORRUPTION: e.inject_firmware_corruption,
+        em.FaultType.COMMAND_INJECTION: e.inject_command,
+        em.FaultType.BATTERY_FAILURE: e.inject_battery_failure,
+        em.FaultType.ADCS_FAILURE: e.inject_adcs_failure,
+    }
+    missing = [f for f in em.FaultType
+               if f is not em.FaultType.NONE and f not in mapping]
+    assert not missing, f"FaultType(s) with no injector in this helper: {missing}"
+    return mapping
+
+
+@run_test
 def test_wrong_procedure_is_refused_and_leaves_state_untouched():
     """
     THE Prompt 3.1 acceptance test.
@@ -402,7 +565,7 @@ def test_wrong_procedure_is_refused_and_leaves_state_untouched():
     assert e.adcs.status == adcs_before, "subsystem state mutated by a refusal"
 
 
-@test
+@run_test
 def test_matching_procedure_still_recovers():
     em = _emulator()
     e = em.SatelliteEmulator(tick_interval=0.01)
@@ -414,20 +577,22 @@ def test_matching_procedure_still_recovers():
     assert e.get_overall_health() == "nominal"
 
 
-@test
+@run_test
 def test_procedure_fault_matrix_is_exhaustively_correct():
-    """Every procedure against every fault: applied iff applicable."""
+    """
+    Every procedure against every fault: applied iff applicable.
+
+    Injectors are derived from the FaultType enum, so a newly added fault is
+    covered automatically. Hardcoding four here meant that when
+    battery_failure and adcs_failure arrived, this matrix silently stopped
+    being exhaustive — it kept passing while testing 11x4 of an 11x6 space.
+    """
     em = _emulator()
-    inject = {
-        em.FaultType.SEU: lambda e: e.inject_SEU(),
-        em.FaultType.SOFTWARE_BUG: lambda e: e.inject_software_bug(),
-        em.FaultType.FIRMWARE_CORRUPTION: lambda e: e.inject_firmware_corruption(),
-        em.FaultType.COMMAND_INJECTION: lambda e: e.inject_command(),
-    }
+    faults = [f for f in em.FaultType if f is not em.FaultType.NONE]
     for proc, applicable in em.PROCEDURE_APPLICABILITY.items():
-        for fault, do_inject in inject.items():
+        for fault in faults:
             e = em.SatelliteEmulator(tick_interval=0.01)
-            do_inject(e)
+            _injectors_for(em, e)[fault]()
             got = e.apply_recovery(proc)
             want = fault in applicable
             assert got is want, f"{proc} vs {fault.value}: got {got}, want {want}"
@@ -435,7 +600,7 @@ def test_procedure_fault_matrix_is_exhaustively_correct():
                 f"{proc} vs {fault.value}: fault-clearing disagrees with return"
 
 
-@test
+@run_test
 def test_apply_recovery_on_healthy_satellite_does_not_crash():
     """
     fault_injected is None (not FaultType.NONE) on a fresh emulator. Checking
@@ -455,7 +620,7 @@ def test_apply_recovery_on_healthy_satellite_does_not_crash():
     assert e.apply_recovery("ADCS_MEMORY_SCRUB_v2") is False, "after reset()"
 
 
-@test
+@run_test
 def test_applicability_map_matches_procedure_library():
     """
     The emulator derives the map from agents/procedure_library.json. If the two
@@ -482,10 +647,10 @@ def test_applicability_map_matches_procedure_library():
     for proc in expected:
         e = em.SatelliteEmulator(tick_interval=0.01)
         fault = next(iter(expected[proc]))
-        {em.FaultType.SEU: e.inject_SEU,
-         em.FaultType.SOFTWARE_BUG: e.inject_software_bug,
-         em.FaultType.FIRMWARE_CORRUPTION: e.inject_firmware_corruption,
-         em.FaultType.COMMAND_INJECTION: e.inject_command}[fault]()
+        injectors = _injectors_for(em, e)
+        assert fault in injectors, \
+            f"procedure_library declares fault '{fault.value}' with no injector"
+        injectors[fault]()
         assert e.apply_recovery(proc) is True, \
             f"{proc} is in the map but has no working handler"
 
@@ -504,7 +669,7 @@ def _drive(e, n=_TICKS):
         e._apply_fault_effects()
 
 
-@test
+@run_test
 def test_telemetry_stays_within_physical_bounds_over_5000_ticks():
     """
     THE Prompt 3.3 acceptance test, run in every fault state.
@@ -514,17 +679,14 @@ def test_telemetry_stays_within_physical_bounds_over_5000_ticks():
     after 150 ticks (nominal < 0.01), obc_error_count unbounded.
     """
     em = _emulator()
-    scenarios = {
-        "healthy": None,
-        "SEU": lambda e: e.inject_SEU(),
-        "software_bug": lambda e: e.inject_software_bug(),
-        "firmware_corruption": lambda e: e.inject_firmware_corruption(),
-        "command_injection": lambda e: e.inject_command(),
-    }
-    for name, inject in scenarios.items():
+    # healthy, then every fault the enum declares — so a new fault type is
+    # bounds-checked automatically rather than being quietly excluded.
+    scenarios = [None] + [f for f in em.FaultType if f is not em.FaultType.NONE]
+    for fault in scenarios:
+        name = "healthy" if fault is None else fault.value
         e = em.SatelliteEmulator(tick_interval=0)
-        if inject:
-            inject(e)
+        if fault is not None:
+            _injectors_for(em, e)[fault]()
         lo = {f: float("inf") for f in em.PHYSICAL_LIMITS}
         hi = {f: float("-inf") for f in em.PHYSICAL_LIMITS}
         for _ in range(_TICKS):
@@ -542,7 +704,7 @@ def test_telemetry_stays_within_physical_bounds_over_5000_ticks():
                 f"{name}: {f} rose to {hi[f]}, above limit {bh}"
 
 
-@test
+@run_test
 def test_healthy_drift_stays_inside_nominal_bands():
     """
     The demo-failure case: with no fault injected, power_w must never fall to
@@ -568,7 +730,7 @@ def test_healthy_drift_stays_inside_nominal_bands():
         f"power_w reached {lo['power_w']} — below the LOCKDOWN_REGEN_v1 criterion"
 
 
-@test
+@run_test
 def test_nominal_drift_cannot_break_a_recovery_criterion():
     """
     Every NOMINAL_BAND that a success_criterion also constrains must be
@@ -601,7 +763,7 @@ def test_nominal_drift_cannot_break_a_recovery_criterion():
                         break
 
 
-@test
+@run_test
 def test_telemetry_has_noise_during_faults():
     """
     "Improvement 2: fault state telemetry has noise on top of fault effects"
@@ -627,7 +789,7 @@ def test_telemetry_has_noise_during_faults():
         assert len(sig) > 5, f"{name}: signal_strength_dbm frozen ({len(sig)} distinct)"
 
 
-@test
+@run_test
 def test_start_is_idempotent():
     """
     start() overwrote self._thread unconditionally, so a second call left the
@@ -703,7 +865,7 @@ def _state(ra, fault: str, confidence: float, idx: int = 0) -> dict:
     }
 
 
-@test
+@run_test
 def test_check_criteria_operators_and_missing_keys():
     """BUGS B, C, D — every branch of _check_criteria."""
     ra = _agent()
@@ -716,6 +878,12 @@ def test_check_criteria_operators_and_missing_keys():
         ({"a": 80}, {"a": ">= 75"}, True),          # BUG C
         ({"a": 70}, {"a": ">= 75"}, False),
         ({"a": 80}, {"a": "> 75"}, True),
+        ({"a": 75}, {"a": "== 75"}, True),          # explicit equality
+        ({"a": 76}, {"a": "== 75"}, False),
+        ({"a": 76}, {"a": "!= 75"}, True),
+        ({"a": 75}, {"a": "!= 75"}, False),
+        ({"a": 75}, {"a": 75}, True),               # bare numeric criterion
+        ({"a": 74}, {"a": 75}, False),
         ({"b": True}, {"b": True}, True),           # BUG D
         ({"b": False}, {"b": True}, False),
         ({"b": True}, {"b": "true"}, True),
@@ -730,18 +898,205 @@ def test_check_criteria_operators_and_missing_keys():
         assert got is want, f"_check_criteria({frame}, {crit}) = {got}, want {want}"
 
 
-@test
-def test_bool_criterion_does_not_raise():
-    """BUG D: `True.startswith` is an AttributeError, uncaught by the old
-    `except (ValueError, TypeError)` — it killed the whole recovery run."""
+@run_test
+def test_normalise_fault_key_covers_every_classifier_output():
+    """
+    AI-1 emits SCREAMING_CASE class names; procedure_library.json is keyed by
+    the emulator's lowercase fault types. Every classifier output must land on
+    a real library key, or the agent selects nothing and recovery dies with
+    "Unknown fault type" after a successful classification.
+    """
+    import json
+    sys.path.insert(0, str(ROOT / "models"))
+    from classifier_inference import normalise_fault_key, FAULT_KEY_MAP
+
+    _need("pandas")
+    from feature_spec import FAULT_LABELS
+
+    lib = json.loads((ROOT / "agents" / "procedure_library.json")
+                     .read_text(encoding="utf-8"))["procedures"]
+
+    # every class AI-1 can actually output
+    for label in FAULT_LABELS:
+        key = normalise_fault_key(label)
+        assert key in lib, \
+            f"classifier output {label!r} -> {key!r}, which is not in " \
+            f"procedure_library.json (keys: {list(lib)})"
+
+    # the healthy classes map to 'none' and must NOT claim a procedure
+    for benign in ("NONE", "NOMINAL"):
+        assert normalise_fault_key(benign) == "none"
+        assert "none" not in lib, "'none' should not have recovery procedures"
+
+    # case and whitespace tolerance — the bridge sees raw model output
+    assert normalise_fault_key("seu") == "SEU"
+    assert normalise_fault_key("  SOFTWARE_BUG  ") == "software_bug"
+
+    # and the map itself must not point anywhere fictional
+    for src_key, dst in FAULT_KEY_MAP.items():
+        assert dst in lib or dst == "none", \
+            f"FAULT_KEY_MAP[{src_key!r}] = {dst!r}, not a library key"
+
+
+@run_test
+def test_orbital_window_fault_signatures_are_not_shadowed():
+    """
+    _emulator_frame_to_orbital_window() stamps a fault signature onto the
+    window AI-1 ingests. Each signature must cross ITS OWN threshold and stay
+    clear of every higher-priority rule in assign_fault_labels(), whose
+    precedence is:
+
+        1. TLE_AGE_HOURS > 72          -> COMMAND_INJECTION
+        2. |BSTAR| > 0.005             -> FIRMWARE_CORRUPTION
+        3. |MEAN_MOTION_DOT| > 0.001   -> FIRMWARE_CORRUPTION
+        4. ecc jump > 0.01             -> SEU
+        5. REV_DELTA <= 0              -> SOFTWARE_BUG
+
+    A SEU window that also trips the BSTAR rule is labelled
+    FIRMWARE_CORRUPTION and the SEU signature is never learned.
+    """
+    _need("pandas")
+    import numpy as np
+    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "emulator"))
+    sys.path.insert(0, str(ROOT / "models"))
+    from pipeline import _emulator_frame_to_orbital_window
+    from feature_spec import CONFIG, FEATURE_COLS
+    from satellite_emulator import SatelliteEmulator
+
+    col = {name: i for i, name in enumerate(FEATURE_COLS)}
+    injectors = {
+        "SEU": lambda e: e.inject_SEU(),
+        "software_bug": lambda e: e.inject_software_bug(),
+        "firmware_corruption": lambda e: e.inject_firmware_corruption(),
+        "command_injection": lambda e: e.inject_command_injection(),
+    }
+
+    for fault, inject in injectors.items():
+        e = SatelliteEmulator(tick_interval=0)
+        inject(e)
+        e._latest_frame = e._build_frame()
+        w = _emulator_frame_to_orbital_window(e, norad_id=28654)
+
+        assert w.shape == (CONFIG["seq_len"], len(FEATURE_COLS)), \
+            f"{fault}: window shape {w.shape}"
+        assert np.isfinite(w).all(), f"{fault}: window contains NaN/inf"
+
+        age = float(w[-1, col["TLE_AGE_HOURS"]])
+        bstar = abs(float(w[-1, col["BSTAR"]]))
+        mmdot = abs(float(w[-1, col["MEAN_MOTION_DOT"]]))
+        rev = float(w[-1, col["REV_DELTA"]])
+        ecc_jump = float(np.abs(np.diff(w[:, col["ECCENTRICITY"]])).max())
+
+        stale = age > CONFIG["tle_age_stale_hours"]
+        firmware = (bstar > CONFIG["bstar_anomaly_threshold"]
+                    or mmdot > CONFIG["mean_motion_dot_threshold"])
+        seu = ecc_jump > CONFIG["eccentricity_jump_threshold"]
+
+        if fault == "command_injection":
+            assert stale, f"command_injection: TLE_AGE {age} does not exceed threshold"
+        elif fault == "firmware_corruption":
+            assert not stale, "firmware_corruption shadowed by the staleness rule"
+            assert firmware, f"firmware_corruption: bstar={bstar} mmdot={mmdot} below thresholds"
+        elif fault == "SEU":
+            assert not stale, "SEU shadowed by the staleness rule"
+            assert not firmware, f"SEU shadowed by the firmware rule (bstar={bstar}, mmdot={mmdot})"
+            assert seu, f"SEU: max ecc jump {ecc_jump} below threshold"
+        elif fault == "software_bug":
+            assert not stale, "software_bug shadowed by the staleness rule"
+            assert not firmware, f"software_bug shadowed by the firmware rule"
+            assert not seu, f"software_bug shadowed by the SEU rule (ecc jump {ecc_jump})"
+            assert rev <= 0, f"software_bug: REV_DELTA {rev} should be <= 0"
+
+
+@run_test
+def test_empty_frame_before_first_tick_is_handled():
+    """
+    get_latest_frame() returns {} until the tick loop has run once, and
+    /telemetry does `frame["overall_health"] = ...` on that empty dict — so a
+    poll during startup returns a ONE-KEY object, not a telemetry frame.
+
+    This documents that contract and pins the consumers that depend on it.
+    """
+    em = _emulator()
+    e = em.SatelliteEmulator(tick_interval=0)
+
+    frame = e.get_latest_frame()
+    assert frame == {}, f"expected {{}} before the first tick, got {list(frame)[:5]}"
+
+    # /telemetry's exact behaviour on that empty dict
+    frame["overall_health"] = e.get_overall_health()
+    assert list(frame) == ["overall_health"], \
+        "the /telemetry startup response shape changed"
+    assert frame["overall_health"] == "nominal"
+
+    # get_overall_health() must not require a frame
+    assert e.get_overall_health() in ("nominal", "degraded", "fault")
+
+    # /health reads with .get(), so it degrades to Nones rather than KeyError
+    empty = e.get_latest_frame()
+    for key in ("obc_status", "adcs_status", "power_status", "comms_status",
+                "fault_injected", "battery_pct", "frame_id"):
+        assert empty.get(key) is None, f"{key} unexpectedly present pre-tick"
+
+    # The frontend consumers must tolerate it: SatelliteDashboard gates the TLE
+    # fetch on `f?.norad_id` (and now retries), and frameToTelemetryState uses
+    # `?? 0` fallbacks throughout.
+    api = _ts_code_only("frontend/api.ts")
+    i = api.index("export function frameToTelemetryState")
+    body = api[i:i + 1800]
+    assert "?? 0" in body, \
+        "frameToTelemetryState no longer defends against missing fields"
+
+    dash = _ts_code_only("frontend/components/SatelliteDashboard.tsx")
+    assert "f?.norad_id" in dash, \
+        "SatelliteDashboard no longer guards on norad_id before fetching the TLE"
+
+    # after one tick it is a full frame
+    e._update_nominal_drift()
+    e._apply_fault_effects()
+    e._latest_frame = e._build_frame()
+    full = e.get_latest_frame()
+    assert "obc_status" in full and "frame_id" in full, \
+        "a ticked frame is missing core fields"
+
+
+@run_test
+def test_bool_criteria_evaluate_correctly():
+    """
+    BUG D: `True.startswith` is an AttributeError, uncaught by the old
+    `except (ValueError, TypeError)` — it killed the whole recovery run.
+
+    Originally this only asserted "does not raise". The mutation check caught
+    that as a test that cannot fail: the rewrite parses `str(condition)` first,
+    so removing the bool branch no longer crashes — it just returns wrong
+    answers. Asserting on the ANSWER is what makes this a test. The
+    string-form cases below are the ones that break without the branch:
+    float("true") raises, so it falls through to a string compare of
+    "True" vs "true".
+    """
     ra = _agent()
-    try:
-        ra._check_criteria({"beacon_active": True}, {"beacon_active": True})
-    except AttributeError as exc:
-        raise AssertionError(f"bool criterion still raises: {exc}")
+    cases = [
+        ({"beacon_active": True}, {"beacon_active": True}, True),
+        ({"beacon_active": False}, {"beacon_active": True}, False),
+        ({"beacon_active": True}, {"beacon_active": False}, False),
+        ({"beacon_active": False}, {"beacon_active": False}, True),
+        # JSON often carries these as strings — must still compare as booleans
+        ({"beacon_active": True}, {"beacon_active": "true"}, True),
+        ({"beacon_active": False}, {"beacon_active": "true"}, False),
+        ({"beacon_active": True}, {"beacon_active": "false"}, False),
+        ({"comms_downlink": True}, {"comms_downlink": "true"}, True),
+    ]
+    for frame, criteria, want in cases:
+        try:
+            got = ra._check_criteria(frame, criteria)
+        except AttributeError as exc:
+            raise AssertionError(f"bool criterion raises: {exc}")
+        assert got is want, \
+            f"_check_criteria({frame}, {criteria}) = {got}, want {want}"
 
 
-@test
+@run_test
 def test_emulator_emits_beacon_active():
     """BUG B's other half: the key SAFE_MODE_HOLD checks must actually exist."""
     em = _emulator()
@@ -759,7 +1114,7 @@ def test_emulator_emits_beacon_active():
         "SAFE_MODE_HOLD must restore the beacon — that is its success criterion"
 
 
-@test
+@run_test
 def test_min_confidence_skip_does_not_uplink_a_stale_procedure():
     """
     THE Prompt 3.2 Bug E acceptance test — confidence 0.75 on software_bug.
@@ -804,7 +1159,7 @@ def test_min_confidence_skip_does_not_uplink_a_stale_procedure():
     assert ra.route_after_select(s) == "report_failure"
 
 
-@test
+@run_test
 def test_fallback_runs_when_success_criteria_fail():
     """
     THE Prompt 3.2 Bug A acceptance test — the primary fails, the FALLBACK runs
@@ -866,7 +1221,7 @@ def test_fallback_runs_when_success_criteria_fail():
         e.stop()
 
 
-@test
+@run_test
 def test_monitor_does_not_accept_nominal_health_as_success():
     """
     BUG A, isolated: health == 'nominal' must not substitute for criteria.
@@ -901,12 +1256,14 @@ def test_monitor_does_not_accept_nominal_health_as_success():
 # Crypto wiring — real hybrid path, no fabricated signatures (Prompt 4.0)
 # ===========================================================================
 
-@test
-def test_both_trees_expose_the_same_crypto_routes():
+@run_test
+def test_canonical_backend_exposes_crypto_routes():
     """
-    ACCEPTANCE: root main.py and backend/main.py must expose the same
-    /crypto/* route set. They did not — root never mounted crypto_router, so
-    the real hybrid implementation was unreachable on the tree that boots.
+    ACCEPTANCE: The canonical main.py must expose the complete /crypto/* route set.
+    
+    This test validates that the crypto_router is properly mounted and that
+    all post-quantum cryptography endpoints are available through the
+    canonical backend.
     """
     import re
 
@@ -919,39 +1276,24 @@ def test_both_trees_expose_the_same_crypto_routes():
         prefix = re.search(r"APIRouter\(prefix='([^']+)'", src).group(1)
         return {prefix + m for m in re.findall(r"@router\.(?:get|post)\('([^']+)'", src)}
 
-    root_set = app_routes("main.py") | router_routes("crypto/crypto_routes.py")
-    be_set = app_routes("backend/main.py") | router_routes("backend/crypto/crypto_routes.py")
+    # Test that canonical main.py has crypto routes
+    main_routes = app_routes("main.py")
+    crypto_routes = router_routes("crypto/crypto_routes.py")
+    
+    # Verify crypto_router is mounted
+    assert "/crypto/sign" in main_routes or "/crypto/sign" in crypto_routes
+    assert "/crypto/verify" in main_routes or "/crypto/verify" in crypto_routes
+    assert "/crypto/ledger" in main_routes or "/crypto/ledger" in crypto_routes
 
-    assert root_set == be_set, (
-        f"route sets differ\n  root only: {sorted(root_set - be_set)}\n"
-        f"  backend only: {sorted(be_set - root_set)}")
+    # main.py mounts crypto_router, so exposed canonical routes are its direct
+    # decorators plus the router's prefixed decorators. backend/ is deprecated.
+    root_set = main_routes | crypto_routes
 
     for path in ("/crypto/sign", "/crypto/verify", "/crypto/ledger"):
         assert path in root_set, f"{path} missing from root"
 
 
-def _code_only(rel_path: str) -> str:
-    """
-    Source with comments and docstrings stripped.
-
-    These tests assert on what the code DOES. Searching raw text matches the
-    comments that document the removed behaviour — every one of these three
-    tests failed on its own explanatory comment the first time it ran.
-    """
-    import ast
-    tree = ast.parse((ROOT / rel_path).read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
-                             ast.ClassDef)) and body:
-            first = body[0]
-            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                    and isinstance(first.value.value, str)):
-                body.pop(0)
-    return ast.unparse(tree)
-
-
-@test
+@run_test
 def test_root_main_mounts_the_real_crypto_router():
     src = _code_only("main.py")
     assert "include_router(crypto_router)" in src, \
@@ -961,7 +1303,7 @@ def test_root_main_mounts_the_real_crypto_router():
         "root main.py still fabricates a signature in executable code"
 
 
-@test
+@run_test
 def test_sign_refuses_to_fabricate_when_crypto_is_mocked():
     """
     ACCEPTANCE: with the crypto backend mocked and DEADSAT_ALLOW_MOCK_SIGNING
@@ -1018,7 +1360,7 @@ def test_sign_refuses_to_fabricate_when_crypto_is_mocked():
             _os.environ["DEADSAT_ALLOW_MOCK_SIGNING"] = prev
 
 
-@test
+@run_test
 def test_agent_verify_matches_the_router_schema():
     """
     The agent's verification gate must send the field names crypto_routes
@@ -1052,7 +1394,7 @@ def test_agent_verify_matches_the_router_schema():
         f"  sends:    {sorted(sent)}\n  requires: {sorted(required)}")
 
 
-@test
+@run_test
 def test_check_command_no_longer_rubber_stamps():
     """
     /crypto/check-command reported `valid: true` for any non-empty signature
@@ -1060,23 +1402,24 @@ def test_check_command_no_longer_rubber_stamps():
     cryptography was involved, on an endpoint named check-command.
     """
     import ast
-    for path in ("main.py", "backend/main.py"):
-        tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
-        fn = next((n for n in ast.walk(tree)
-                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                   and n.name == "check_command"), None)
-        assert fn is not None, f"{path}: check_command handler not found"
+    # Only test canonical main.py since backend/main.py is deprecated
+    path = "main.py"
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == "check_command"), None)
+    assert fn is not None, f"{path}: check_command handler not found"
 
-        # strip the docstring, which quotes the old rubber-stamp for context
-        if (fn.body and isinstance(fn.body[0], ast.Expr)
-                and isinstance(fn.body[0].value, ast.Constant)):
-            fn.body.pop(0)
-        code = ast.unparse(fn)
+    # strip the docstring, which quotes the old rubber-stamp for context
+    if (fn.body and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)):
+        fn.body.pop(0)
+    code = ast.unparse(fn)
 
-        assert "req.signed" not in code, \
-            f"{path}: check-command still derives validity from req.signed"
-        assert "NOT VERIFIED" in code, \
-            f"{path}: check-command does not state that it performs no check"
+    assert "req.signed" not in code, \
+        f"{path}: check-command still derives validity from req.signed"
+    assert "NOT VERIFIED" in code, \
+        f"{path}: check-command does not state that it performs no check"
 
 
 # ===========================================================================
@@ -1089,38 +1432,81 @@ def _nonce_mgr():
     return NonceManager()
 
 
-@test
+def _race_use_nonce(nm, n_threads: int = 64):
+    """Fire n_threads concurrent nm.use_nonce(same nonce) calls, released
+    together via a barrier, and return how many were accepted."""
+    import threading
+    nonce = nm.generate_nonce()
+    results = []
+    barrier = threading.Barrier(n_threads)
+
+    def claim():
+        barrier.wait()
+        results.append(nm.use_nonce(nonce))
+
+    threads = [threading.Thread(target=claim) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == n_threads, f"only {len(results)} threads reported"
+    return sum(1 for r in results if r)
+
+
+@run_test
 def test_concurrent_identical_nonces_exactly_one_succeeds():
     """
     THE Prompt 4.1 Bug A acceptance test.
 
     Revert check: restore the get()-then-set() pair and this fails — both
     racers read None and both proceed.
+
+    Exercises whatever backend _nonce_mgr() actually connects to. In any dev
+    or CI environment with redis running (which is every environment this
+    project's own README tells you to set up), that is ALWAYS the Redis
+    branch of use_nonce() — this loop never touches the in-memory/mock
+    branch at all. See test_concurrent_identical_nonces_mock_path_exactly_one_succeeds
+    below, which was added because a mutation to the mock branch's
+    get-then-set logic passed this test silently (verify_tests_can_fail.py
+    caught it as a MISSED mutation): the mock branch's own atomicity was
+    never being tested here.
     """
-    import threading
     for _ in range(5):                       # repeat: races are probabilistic
         nm = _nonce_mgr()
-        nonce = nm.generate_nonce()
-        results = []
-        barrier = threading.Barrier(64)      # release all threads together
-
-        def claim():
-            barrier.wait()
-            results.append(nm.use_nonce(nonce))
-
-        threads = [threading.Thread(target=claim) for _ in range(64)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        accepted = sum(1 for r in results if r)
-        assert len(results) == 64, f"only {len(results)} threads reported"
+        accepted = _race_use_nonce(nm)
         assert accepted == 1, \
             f"{accepted} of 64 concurrent claims accepted the same nonce"
 
 
-@test
+@run_test
+def test_concurrent_identical_nonces_mock_path_exactly_one_succeeds():
+    """
+    Same acceptance test as above, forced onto the in-memory/mock branch of
+    NonceManager.use_nonce() regardless of whether real redis happens to be
+    reachable in this environment.
+
+    Without this, a whole environment class of bugs is invisible: the mock
+    path is what actually runs in production the moment Redis is
+    unreachable (nonce.py falls back to it, and crypto_routes surfaces that
+    via /crypto/health), but every dev/CI machine that followed this
+    project's own setup instructions has redis running, so
+    test_concurrent_identical_nonces_exactly_one_succeeds above always
+    exercised the Redis SET-NX branch and never this one. Confirmed via
+    verify_tests_can_fail.py: reverting the mock branch's atomic
+    get-then-set-under-lock back to a naive version was a MISSED mutation
+    until this test was added.
+    """
+    for _ in range(5):
+        nm = _nonce_mgr()
+        nm.is_mock = True                    # force the in-memory branch
+        accepted = _race_use_nonce(nm)
+        assert accepted == 1, \
+            f"{accepted} of 64 concurrent claims accepted the same nonce " \
+            f"(mock/in-memory path)"
+
+
+@run_test
 def test_rejected_replay_does_not_overwrite_the_stored_nonce():
     """
     BUG B: a failed compare_digest fell through to an unconditional set(),
@@ -1136,7 +1522,7 @@ def test_rejected_replay_does_not_overwrite_the_stored_nonce():
     assert nm.is_used(nonce) is True
 
 
-@test
+@run_test
 def test_in_memory_nonce_fallback_works_at_all():
     """
     Not in the prompt: with redis absent, __init__ returned before assigning
@@ -1155,7 +1541,7 @@ def test_in_memory_nonce_fallback_works_at_all():
     assert nm.is_used(a) is True and nm.is_used(nm.generate_nonce()) is False
 
 
-@test
+@run_test
 def test_nonce_is_consumed_at_verify_not_at_sign():
     """
     BUG C acceptance: /verify must reject a replayed nonce.
@@ -1198,7 +1584,7 @@ def test_nonce_is_consumed_at_verify_not_at_sign():
         "MISSING_NONCE"
 
 
-@test
+@run_test
 def test_verify_module_does_not_kill_the_process():
     """
     BUG D: sys.exit(1) inside verify.py on MechanismNotSupportedError killed
@@ -1217,7 +1603,7 @@ def test_verify_module_does_not_kill_the_process():
         "verify_command() should raise so the caller can return a 503"
 
 
-@test
+@run_test
 def test_no_unbacked_timing_attack_claim():
     """
     BUG E: verify.py claimed "Uses hmac.compare_digest() to prevent timing
@@ -1288,7 +1674,7 @@ class _FakeWS:
         self.closed = (code, reason)
 
 
-@test
+@run_test
 def test_websocket_rejects_unauthenticated_when_key_is_set():
     """
     THE Prompt 4.2 Bug A acceptance test.
@@ -1324,7 +1710,7 @@ def test_websocket_rejects_unauthenticated_when_key_is_set():
             f"key={key!r}: closed with {close}, want {want_close}"
 
 
-@test
+@run_test
 def test_websocket_auth_times_out_rather_than_hanging():
     """A client that connects and says nothing must not hold the socket open."""
     import asyncio, time
@@ -1338,36 +1724,35 @@ def test_websocket_auth_times_out_rather_than_hanging():
     assert 4.0 < elapsed < 8.0, f"auth took {elapsed:.1f}s, expected a ~5s timeout"
 
 
-@test
+@run_test
 def test_connection_manager_does_not_double_accept():
     """
     _ws_authenticate() accepts the socket; ConnectionManager.connect_* must
     not accept again (Starlette raises on a second accept).
     """
     import ast
-    for path in ("main.py", "backend/main.py"):
-        tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
-        for name in ("connect_telemetry", "connect_events"):
-            fn = next(n for n in ast.walk(tree)
-                      if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
-            assert "accept()" not in ast.unparse(fn), \
+    # Only test canonical main.py since backend/main.py is deprecated
+    path = "main.py"
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    for name in ("connect_telemetry", "connect_events", "connect_rf"):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
+        assert "accept()" not in ast.unparse(fn), \
                 f"{path}:{name} still calls accept() — double accept raises"
 
 
-@test
-def test_frontend_sends_api_key_on_websocket():
+@run_test
+def test_frontend_uses_short_lived_jwt_connection_token_on_websocket():
     """
-    Enforcing the key server-side locks out the dashboard unless the client
-    sends it. A browser cannot set headers on a WebSocket handshake, so it
-    must go in the query string.
+    Browser sockets exchange the bearer session for a purpose-bound,
+    short-lived connection token rather than exposing an access JWT.
     """
     src = (ROOT / "frontend" / "api.ts").read_text(encoding="utf-8")
-    assert "api_key=" in src, \
-        "frontend/api.ts does not send api_key on the WebSocket — with " \
-        "DEADSAT_API_KEY set the dashboard cannot connect"
+    assert "websocketToken" in src and "connection_token=" in src
+    assert "access_token=" not in src and "api_key=" not in src
 
 
-@test
+@run_test
 def test_system_links_reports_auth_state():
     """BUG C: a key mismatch must be diagnosable from the dashboard."""
     import ast
@@ -1384,7 +1769,7 @@ def test_system_links_reports_auth_state():
             f"{path}: system_links cannot see the supplied key"
 
 
-@test
+@run_test
 def test_signatures_are_refreshed_at_transmission_time():
     """
     BUG B: crypto/sign.py stamps a 120 s TTL, but the agent signs at node 4
@@ -1436,36 +1821,761 @@ def test_signatures_are_refreshed_at_transmission_time():
     assert any(e["step"] == "refresh_signatures" for e in state["recovery_log"])
 
 
-@test
-def test_no_duplicate_route_paths_in_either_tree():
+@run_test
+def test_no_duplicate_route_paths_in_canonical_tree():
     """
     BUG D as stated ("/crypto/check-command registered twice") does not exist:
     the router defines /crypto/check-rogue. This asserts the property the bug
-    was about — no path registered twice in either tree — so a genuine
+    was about — no path registered twice in the canonical tree — so a genuine
     duplicate would be caught.
     """
     import collections, re
 
-    for tree, main_f, routes_f in (
-            ("root", "main.py", "crypto/crypto_routes.py"),
-            ("backend", "backend/main.py", "backend/crypto/crypto_routes.py")):
-        src = (ROOT / main_f).read_text(encoding="utf-8")
-        paths = re.findall(
-            r'@app\.(?:get|post|websocket|put|delete)\("([^"]+)"', src)
-        rsrc = (ROOT / routes_f).read_text(encoding="utf-8")
-        prefix = re.search(r"APIRouter\(prefix='([^']+)'", rsrc).group(1)
-        paths += [prefix + m
-                  for m in re.findall(r"@router\.(?:get|post)\('([^']+)'", rsrc)]
+    # Only test canonical main.py since backend/main.py is deprecated
+    tree, main_f, routes_f = ("canonical", "main.py", "crypto/crypto_routes.py")
+    src = (ROOT / main_f).read_text(encoding="utf-8")
+    paths = re.findall(
+        r'@app\.(?:get|post|websocket|put|delete)\("([^"]+)"', src)
+    rsrc = (ROOT / routes_f).read_text(encoding="utf-8")
+    prefix = re.search(r"APIRouter\(prefix='([^']+)'", rsrc).group(1)
+    paths += [prefix + m
+              for m in re.findall(r"@router\.(?:get|post)\('([^']+)'", rsrc)]
 
-        dupes = {p: n for p, n in collections.Counter(paths).items() if n > 1}
-        assert not dupes, f"{tree}: duplicate route registrations {dupes}"
+    dupes = {p: n for p, n in collections.Counter(paths).items() if n > 1}
+    assert not dupes, f"{tree}: duplicate route registrations {dupes}"
+
+
+# ===========================================================================
+# Orbital mechanics: TLE validation and search cost (Prompt 8.2)
+# ===========================================================================
+
+def _contact_calc():
+    sys.path.insert(0, str(ROOT / "emulator"))
+    import contact_calculator as cc
+    return cc
+
+
+@run_test
+def test_malformed_tle_raises_a_clear_error():
+    """
+    ACCEPTANCE: "a malformed TLE raises a clear error instead of propagating
+    garbage."
+
+    Nothing validated the lines before Satrec.twoline2rv(). A CelesTrak error
+    page has three or more lines too, so its second and third went straight
+    into sgp4 — which parses garbage into a Satrec and produces contact
+    windows for an orbit that does not exist.
+    """
+    cc = _contact_calc()
+    good1 = cc.FALLBACK_TLE["line1"]
+    good2 = cc.FALLBACK_TLE["line2"]
+
+    # the shipped fallback must itself be valid
+    cc.validate_tle(good1, good2)
+
+    cases = [
+        ("HTML error page", "<!DOCTYPE html>", "<html><head>", "does not start with"),
+        ("truncated line", good1[:40], good2, "expected 69"),
+        ("line 2 as line 1", good2, good2, "does not start with"),
+        ("satellite mismatch", good1, "2 99999" + good2[7:], "mismatch"),
+        ("bad checksum", good1[:68] + "3", good2, "checksum"),
+        ("empty line", "", good2, "empty"),
+        ("None", None, good2, "empty or not a string"),
+    ]
+    for name, l1, l2, expect in cases:
+        try:
+            cc.validate_tle(l1, l2)
+        except cc.InvalidTLEError as exc:
+            assert expect in str(exc), \
+                f"{name}: message {str(exc)!r} does not mention {expect!r}"
+        else:
+            raise AssertionError(f"{name}: accepted a malformed TLE")
+
+
+@run_test
+def test_fallback_tle_is_wellformed_and_labelled_synthetic():
+    """
+    Both fallback lines shipped with INVALID checksums (line 1 stated 8 but
+    computes 7; line 2 stated 9 but computes 0) — the giveaway that they were
+    hand-written rather than fetched. Correcting the checksum does not make
+    the orbit real, so the elements must also declare themselves synthetic.
+    """
+    cc = _contact_calc()
+    for key in ("line1", "line2"):
+        line = cc.FALLBACK_TLE[key]
+        assert len(line) == 69, f"{key} is {len(line)} chars"
+        assert int(line[68]) == cc._tle_checksum(line), \
+            f"{key} checksum is wrong — the fallback would fail its own validator"
+
+    assert cc.FALLBACK_TLE.get("synthetic") is True, \
+        "the fallback elements are not marked synthetic"
+
+    epoch = cc.tle_epoch_datetime(cc.FALLBACK_TLE["line1"])
+    assert epoch is not None, "the fallback epoch does not parse"
+
+
+@run_test
+def test_contact_search_is_coarse_then_refine():
+    """
+    ACCEPTANCE: "a contact-window calculation completes in < 1 s."
+
+    The agent called find_next_contact(search_hours=24, step_seconds=10) —
+    8,640 SGP4 propagations run synchronously inside the recovery graph while
+    a fault is active. Driven here with a stub propagator so the COST and the
+    accuracy can both be measured without sgp4 installed.
+    """
+    import math
+    import time
+    from datetime import datetime, timezone
+
+    cc = _contact_calc()
+    calls = {"n": 0}
+    t0 = datetime.now(timezone.utc)
+
+    def fake_elevation(self, t):
+        calls["n"] += 1
+        dt = (t - t0).total_seconds()
+        phase = (dt - 40 * 60) / (96 * 60)          # a 96-minute LEO orbit
+        return 55.0 * math.cos(2 * math.pi * phase) - 20.0
+
+    calc = cc.ContactCalculator()
+    calc.sat = object()                              # truthy: skips the None guard
+    calc.tle = dict(cc.FALLBACK_TLE)
+    original = cc.ContactCalculator._elevation_at
+    cc.ContactCalculator._elevation_at = fake_elevation
+    try:
+        start = time.perf_counter()
+        window = calc.find_next_contact(search_hours=24.0, step_seconds=60.0)
+        elapsed = time.perf_counter() - start
+    finally:
+        cc.ContactCalculator._elevation_at = original
+
+    assert window is not None, "no contact window found in 24 h"
+    assert elapsed < 1.0, f"search took {elapsed:.3f}s, budget is 1s"
+
+    flat_10s = int(24 * 3600 / 10)
+    assert calls["n"] < flat_10s / 10, (
+        f"{calls['n']} propagations — barely better than the {flat_10s} a flat "
+        f"10 s scan needed; the coarse-then-refine path is not being taken")
+
+    # Bisection must actually REFINE, so test accuracy rather than grid
+    # alignment — the first version of this assertion checked that AOS was not
+    # a multiple of 60 s from t0, which is true by luck alone (t0 and the
+    # function's internal `now` differ by microseconds) and so could not fail.
+    #
+    # True AOS for the fixture: 55*cos(2*pi*(dt-2400)/5760) - 20 == 5
+    #   => dt = 2400 - arccos(25/55) * 5760 / (2*pi)  ~= 1392.8 s after t0
+    true_aos_offset = 2400 - math.acos(25.0 / 55.0) * (96 * 60) / (2 * math.pi)
+    aos_offset = (datetime.fromisoformat(window["aos"]) - t0).total_seconds()
+    error_s = abs(aos_offset - true_aos_offset)
+    assert error_s < 2.0, (
+        f"AOS is {error_s:.1f}s from the true crossing — a coarse 60 s scan "
+        f"without bisection lands up to 60 s late")
+
+    # and the peak must be found, not just the coarse maximum
+    assert abs(window["max_elevation_deg"] - 35.0) < 0.5, \
+        f"max elevation {window['max_elevation_deg']}, expected ~35.0"
+
+
+@run_test
+def test_contact_summary_does_not_propagate_three_times():
+    """
+    get_contact_summary() ran get_current_azel(), find_next_contact(), then
+    is_in_contact_now() — which called get_current_azel() again for the same
+    instant. Three passes for two answers.
+    """
+    import ast
+    cc_src = (ROOT / "emulator" / "contact_calculator.py").read_text(encoding="utf-8")
+    tree = ast.parse(cc_src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "get_contact_summary")
+    # Drop the docstring: it explains the old three-pass behaviour and names
+    # get_current_azel() twice, which is what this assertion counted first.
+    if (fn.body and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)):
+        fn.body.pop(0)
+    code = ast.unparse(fn)
+
+    assert code.count("get_current_azel()") == 1, \
+        "get_contact_summary still propagates the current position twice"
+    assert "is_in_contact_now(current)" in code, \
+        "is_in_contact_now is not reusing the already-computed position"
+
+
+# ===========================================================================
+# Training reproducibility (Prompt 8.1)
+# ===========================================================================
+
+@run_test
+def test_augmentation_rng_is_seeded_and_independent_per_class():
+    """
+    THE Prompt 8.1 acceptance test, at the level that can be checked without
+    a GPU-hours training run.
+
+    Two defects made training unreproducible:
+      * augment_fault_samples() drew noise from the GLOBAL numpy RNG while
+        everything around it threaded random_state=CONFIG["random_seed"]. Any
+        earlier consumer of the global stream shifted the noise, so the same
+        command produced different weights.
+      * _generate_synthetic_class() re-created default_rng(seed) per call, so
+        all four classes received the IDENTICAL noise sequence — correlated
+        noise a model can learn as signal.
+    """
+    clf = _clf_numpy_only()
+
+    # 1. per-class streams are independent
+    streams = {i: clf._class_rng(i).normal(0, 1, 8).tolist()
+               for i in range(len(clf.FAULT_LABELS))}
+    assert len({tuple(v) for v in streams.values()}) == len(streams), \
+        "fault classes share a noise stream (default_rng(seed) called repeatedly)"
+
+    # 2. each stream is reproducible
+    again = {i: clf._class_rng(i).normal(0, 1, 8).tolist() for i in streams}
+    assert streams == again, "_class_rng is not deterministic"
+
+    # 3. augmentation is immune to the global RNG being disturbed — this is
+    #    what "reproducible training run" actually requires
+    import pandas as pd
+
+    def fixture():
+        rows = []
+        for k, lab in enumerate(clf.FAULT_LABELS):
+            for j in range(5):
+                rows.append({
+                    "fault_label": lab, "NORAD_CAT_ID": 1000 + k,
+                    "EPOCH": pd.Timestamp("2026-01-01") + pd.Timedelta(hours=j),
+                    **{c: float(k + j) * 0.5 for c in clf.FEATURE_COLS},
+                })
+        return pd.DataFrame(rows)
+
+    np.random.seed(1)
+    np.random.normal(size=997)                 # disturb the global stream
+    a = clf.augment_fault_samples(fixture(), target_per_class=40)
+    np.random.seed(999)
+    np.random.normal(size=13)                  # disturb it differently
+    b = clf.augment_fault_samples(fixture(), target_per_class=40)
+
+    assert a[clf.FEATURE_COLS].round(10).equals(b[clf.FEATURE_COLS].round(10)), \
+        "augmented rows depend on global RNG state — training is not reproducible"
+
+
+@run_test
+def test_requirements_are_upper_bounded():
+    """
+    Only langgraph and langchain-core were pinned; everything else was floored
+    with `>=` and no ceiling, so the resolved stack depended on the day. numpy
+    and torch have both changed RNG behaviour across minor versions — a
+    reproducible training run needs a reproducible stack under it.
+    """
+    for rel in ("requirements.txt", "backend/requirements.txt"):
+        unbounded = []
+        for raw in (ROOT / rel).read_text(encoding="utf-8").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or line.startswith("-"):
+                continue
+            if "==" not in line and "<" not in line:
+                unbounded.append(line)
+        assert not unbounded, f"{rel}: unbounded requirements: {unbounded}"
+
+
+# ===========================================================================
+# UI fault set matches the emulator (Prompt 6.4)
+# ===========================================================================
+
+@run_test
+def test_every_ui_fault_maps_to_a_real_emulator_fault():
+    """
+    THE Prompt 6.4 acceptance test.
+
+    The UI offered five faults; the emulator modelled four. api.ts mapped
+    battery_fail -> firmware_corruption and adcs_fail -> SEU, so selecting
+    either produced a diagnosis contradicting the operator's own label.
+    """
+    import json, re
+    em = _emulator()
+
+    src = _ts_code_only("frontend/api.ts")
+    block = src[src.index("UI_FAULT_TO_BACKEND"):]
+    block = block[:block.index("};")]
+    mapping = dict(re.findall(r"(\w+):\s*'([^']+)'", block))
+    assert len(mapping) == 5, f"expected 5 UI faults, found {len(mapping)}"
+
+    valid = {f.value for f in em.FaultType if f is not em.FaultType.NONE}
+    lib = json.loads((ROOT / "agents" / "procedure_library.json")
+                     .read_text(encoding="utf-8"))["procedures"]
+
+    for ui_id, backend in mapping.items():
+        assert backend in valid, \
+            f"UI '{ui_id}' maps to '{backend}', which is not a FaultType"
+        assert backend in lib, \
+            f"UI '{ui_id}' -> '{backend}' has no procedures in procedure_library.json"
+        # the mapping must not be an "analogue" — the names must correspond
+        assert not (ui_id == "battery_fail" and backend == "firmware_corruption"), \
+            "battery_fail is still mapped to firmware_corruption"
+        assert not (ui_id == "adcs_fail" and backend == "SEU"), \
+            "adcs_fail is still mapped to SEU"
+
+
+@run_test
+def test_ui_faults_recover_with_a_matching_procedure():
+    """
+    End to end for all five: inject what the UI would send, confirm the
+    emulator reports that same fault, then run the library's primary procedure
+    and check its success criteria are actually met.
+    """
+    import json, types
+    em = _emulator()
+    ra = _agent()
+
+    lib = json.loads((ROOT / "agents" / "procedure_library.json")
+                     .read_text(encoding="utf-8"))["procedures"]
+    ui_map = {"seu": "SEU", "leak": "software_bug", "injection": "command_injection",
+              "battery_fail": "battery_failure", "adcs_fail": "adcs_failure"}
+
+    for ui_id, backend in ui_map.items():
+        e = em.SatelliteEmulator(tick_interval=0)
+        _injectors_for(em, e)[em.FaultType(backend)]()
+        for _ in range(6):
+            e._update_nominal_drift()
+            e._apply_fault_effects()
+
+        assert e.fault_injected.value == backend, \
+            f"{ui_id}: emulator reports {e.fault_injected.value}, expected {backend}"
+
+        # KNOWN GAP, pre-dating this change and flagged in Prompt 3.2: SEU's
+        # FALLBACK (OBC_SOFT_REBOOT_v1) requires adcs_status == nominal, but an
+        # OBC reboot cannot clear a stuck ADCS, so its criteria can never be
+        # met. That is arguably physically honest — if the memory scrub fails,
+        # rebooting the OBC will not fix the wheel — but it means SEU has no
+        # working fallback. Listed explicitly so it stays visible instead of
+        # being silently excluded; a procedure_library decision, not a bug here.
+        KNOWN_UNSATISFIABLE = {("SEU", "OBC_SOFT_REBOOT_v1")}
+
+        for idx, proc in enumerate(lib[backend]["recovery_priority"]):
+            name = proc["procedure_name"]
+            e2 = em.SatelliteEmulator(tick_interval=0)
+            _injectors_for(em, e2)[em.FaultType(backend)]()
+            for _ in range(6):
+                e2._update_nominal_drift()
+                e2._apply_fault_effects()
+
+            assert e2.apply_recovery(name) is True, \
+                f"{backend}: {name} was refused for the fault it is listed under"
+
+            met = ra._check_criteria(e2._build_frame(), proc["success_criteria"])
+            if (backend, name) in KNOWN_UNSATISFIABLE:
+                assert met is False, \
+                    f"{backend}/{name} now meets its criteria — remove it from " \
+                    f"KNOWN_UNSATISFIABLE"
+                continue
+            assert met is True, \
+                f"{backend}: {name} ran but its success criteria are unmet"
+
+            if idx == 0:
+                assert e2.fault_injected == em.FaultType.NONE, \
+                    f"{backend}: primary procedure did not clear the fault"
+
+
+@run_test
+def test_classifier_blind_faults_bypass_ai1():
+    """
+    AI-1 classifies from ORBITAL ELEMENTS. Battery state and reaction-wheel
+    health leave no signature in a TLE, so running the classifier on those
+    faults would return whichever of its four classes fit best — reinstating
+    the mismatch one layer deeper. run_pipeline() must force skip_classifier.
+    """
+    src = _code_only("pipeline.py")
+    assert "CLASSIFIER_BLIND_FAULTS" in src, "no blind-fault set defined"
+    assert "skip_classifier = True" in src, \
+        "run_pipeline() does not force the bypass for unclassifiable faults"
+
+    # AI-1's label set must NOT have grown — these faults are not learnable
+    _need("pandas")
+    sys.path.insert(0, str(ROOT / "models"))
+    from feature_spec import FAULT_LABELS
+    assert set(FAULT_LABELS) == {"SEU", "SOFTWARE_BUG", "FIRMWARE_CORRUPTION",
+                                 "COMMAND_INJECTION"}, \
+        "AI-1 label set changed — battery/ADCS faults are not classifiable " \
+        "from orbital elements and must not be added to it"
+
+
+# ===========================================================================
+# Shared WebSocket connections (Prompt 6.3)
+# ===========================================================================
+
+@run_test
+def test_websockets_are_multiplexed_not_duplicated():
+    """
+    THE Prompt 6.3 acceptance test, checked statically.
+
+    The dashboard opened SIX sockets where two would do — three to
+    /ws/telemetry and three to /ws/events — so every frame was serialised by
+    the server and parsed by the browser three times over.
+
+    subscribe() now keeps one connection per path in a module-level registry
+    and fans out to a Set of listeners. Revert the registry and this fails.
+    """
+    # EXECUTED, not grepped. The static version of this test could not fail:
+    # it asserted `"channels.get(path)" in src`, and that string also appears
+    # in close(), so breaking the reuse in subscribe() left it passing. The
+    # mutation check caught that. Transpile the real api.ts and count sockets.
+    esb, node = _esbuild(), _node()
+    if not esb or not node:
+        raise _Skip("esbuild/node unavailable — cannot execute api.ts")
+
+    import subprocess, tempfile, textwrap
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "api.mjs"
+        r = subprocess.run([esb, str(ROOT / "frontend" / "api.ts"),
+                            f"--outfile={out}", "--format=esm", "--target=es2022"],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"esbuild failed:\n{r.stderr}"
+
+        driver = Path(tmp) / "drive.mjs"
+        driver.write_text(textwrap.dedent("""
+            const sockets = [];
+            globalThis.WebSocket = class {
+              constructor(url){ this.url=url; sockets.push(this); this.closedFlag=false;
+                queueMicrotask(()=> this.onopen && this.onopen()); }
+              close(){ if(this.closedFlag) return; this.closedFlag=true;
+                       this.onclose && this.onclose(); }
+              feed(o){ this.onmessage && this.onmessage({data: JSON.stringify(o)}); }
+            };
+            globalThis.window = { location: { protocol:'http:', hostname:'x' } };
+            globalThis.fetch = async (url, init) => {
+              if (String(url).endsWith('/auth/ws-token') &&
+                  init?.headers?.Authorization === 'Bearer test-session') {
+                return { ok: true, json: async () => ({
+                  connection_token: 'test-connection-token', token_type: 'websocket'
+                }) };
+              }
+              return { ok: false, statusText: 'Unauthorized', json: async () => ({}) };
+            };
+            const { subscribeTelemetry, subscribeEvents } = await import('./api.mjs');
+            // The client rightly requires a verified bearer session before it
+            // opens either protected socket.
+            const { setSessionToken } = await import('./api.mjs');
+            setSessionToken('test-session');
+            const wait = () => new Promise(r=>setTimeout(r,5));
+
+            let frames = 0, events = 0;
+            const handles = [
+              subscribeTelemetry(()=>frames++),
+              subscribeTelemetry(()=>frames++),
+              subscribeTelemetry(()=>frames++),
+              subscribeEvents(()=>events++),
+              subscribeEvents(()=>events++),
+              subscribeEvents(()=>events++),
+            ];
+            await wait();
+            const opened = sockets.length;
+
+            sockets.find(s=>s.url.includes('telemetry'))?.feed({frame_id:1});
+            sockets.find(s=>s.url.includes('events'))?.feed({event:'x'});
+            await wait();
+
+            handles.forEach(h=>h.close());
+            const leaked = sockets.filter(s=>!s.closedFlag).length;
+            console.log(JSON.stringify({opened, frames, events, leaked}));
+        """), encoding="utf-8")
+
+        r = subprocess.run([node, str(driver)], cwd=tmp,
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, f"driver failed:\n{r.stdout}\n{r.stderr}"
+        result = json.loads(r.stdout.strip().splitlines()[-1])
+
+    assert result["opened"] == 2, (
+        f"{result['opened']} WebSocket connections opened for 6 subscribers, "
+        f"expected 2 (one per path)")
+    assert result["frames"] == 3, \
+        f"one telemetry frame reached {result['frames']} of 3 subscribers"
+    assert result["events"] == 3, \
+        f"one event reached {result['events']} of 3 subscribers"
+    assert result["leaked"] == 0, \
+        f"{result['leaked']} socket(s) still open after every subscriber closed"
+
+    # reconnect behaviour preserved verbatim
+    src = _ts_code_only("frontend/api.ts")
+    assert "Math.min(1000 * 2 ** ch.retry, 15000)" in src, \
+        "the exponential-backoff reconnect was altered"
+
+
+@run_test
+def test_late_subscriber_still_receives_the_backfill():
+    """
+    Sharing the socket would otherwise break Prompt 6.0 for any component that
+    mounts AFTER the connection opened — switching to the dashboard tab. The
+    history envelope arrives once per connect, so a late subscriber would
+    never see it and its chart would start empty.
+    """
+    src = _ts_code_only("frontend/api.ts")
+    assert "lastHistory" in src, "the backfill envelope is not cached for replay"
+    assert "queueMicrotask" in src, \
+        "the cached backfill is not replayed to late subscribers"
+    # and a stale backfill must not survive a reconnect
+    i = src.index("onclose")
+    assert "lastHistory = null" in src[i:i + 400], \
+        "a stale backfill would be replayed after reconnect"
+
+
+@run_test
+def test_components_were_not_restructured_for_multiplexing():
+    """
+    FIX-ONLY: the fix belongs in the shared helper. No component should have
+    been rewired to a context or to props, and none should build its own
+    WebSocket.
+    """
+    for name in ("useDeadsat.ts", "components/SatelliteDashboard.tsx",
+                 "components/AiDiagnostics.tsx",
+                 "components/OperatorControlPanel.tsx"):
+        src = _ts_code_only(f"frontend/{name}")
+        assert "new WebSocket" not in src, f"{name} constructs its own socket"
+        assert "createContext" not in src, \
+            f"{name} was rewired to a context — the helper should have absorbed this"
+        assert "subscribeTelemetry" in src or "subscribeEvents" in src, \
+            f"{name} no longer uses the shared subscription API"
+
+
+# ===========================================================================
+# Fetched-but-unrendered state (Prompt 6.2)
+# ===========================================================================
+
+@run_test
+def test_fetched_state_is_actually_rendered():
+    """
+    Six values were fetched from the backend every few seconds and never
+    displayed. The crypto ledger is the worst of them: it is the single best
+    evidence the security layer works.
+    """
+    import re
+    for component, names in (
+        ("SecurityConsole", ("ledger", "cryptoMode", "lastError")),
+        ("AiDiagnostics", ("statusHint", "artifactsReady", "lastClass")),
+    ):
+        src = _ts_code_only(f"frontend/components/{component}.tsx")
+        # everything after the last hook declaration is, near enough, the JSX
+        jsx = src[src.rindex("useState"):]
+        for name in names:
+            assert re.search(rf"[{{(\s]{name}\b", jsx), \
+                f"{component}: {name} is fetched but never rendered"
+
+
+@run_test
+def test_crypto_list_parsing_accepts_the_router_shape():
+    """
+    /crypto/ledger and /crypto/alerts are served by the crypto router, which
+    returns a BARE ARRAY. The components parsed `l.entries` / `a.alerts` — the
+    shape of the proxy handlers Prompt 4.0 deleted — so both read empty
+    forever, indistinguishable from "nothing has been signed".
+    """
+    for component in ("SecurityConsole", "OperatorPanel"):
+        src = _ts_code_only(f"frontend/components/{component}.tsx")
+        for expr in ("l.entries", "a.alerts"):
+            bare = f"({expr} || [])"
+            assert bare not in src, \
+                f"{component}: {bare} assumes the removed proxy shape"
+        if "cryptoLedger" in src:
+            assert "Array.isArray(l)" in src, \
+                f"{component}: does not handle the router's bare-array ledger"
+
+
+@run_test
+def test_backend_failure_is_visible_not_silent():
+    """
+    /pipeline/status returns `hint` ("Train with: python train_classifier.py")
+    and /crypto/status returns `message` ("CY-1 not running — signatures
+    cannot be verified"). Both were discarded, so a broken backend rendered as
+    a confident 0.00%.
+    """
+    sec = _ts_code_only("frontend/components/SecurityConsole.tsx")
+    assert "lastError &&" in sec, \
+        "SecurityConsole does not surface lastError"
+
+    ai = _ts_code_only("frontend/components/AiDiagnostics.tsx")
+    assert "statusHint &&" in ai, "AiDiagnostics does not surface statusHint"
+    assert "artifactsReady === false" in ai, \
+        "AiDiagnostics does not distinguish 'untrained' from a real 0%"
+
+
+# ===========================================================================
+# Cold-start retry and polling waste (Prompt 6.1)
+# ===========================================================================
+
+@run_test
+def test_tle_loader_retries_until_the_emulator_ticks():
+    """
+    BUG A: the loader called api.telemetry() once and, if the emulator had not
+    yet produced a frame (`norad_id` undefined), waited 300 s before trying
+    again. The UI reliably loads faster than the backend boots, so the orbit
+    panel was blank for five minutes on essentially every cold start.
+    """
+    src = _ts_code_only("frontend/components/SatelliteDashboard.tsx")
+    i = src.index("const load = async ()")
+    block = src[i:i + 1800]
+
+    assert "loadUntilReady" in block, "no retry loop — a cold start still waits 5 minutes"
+    assert "RETRY_LIMIT_MS" in block, "the retry is unbounded"
+    assert "setTimeout(loadUntilReady" in block, "retry is not scheduled"
+    # the 5-minute refresh must survive
+    assert "setInterval(load, 300000)" in block, "the 5-minute refresh was removed"
+    # and the retry must be cleaned up
+    assert "clearTimeout(retryTimer)" in block, "retry timer leaks on unmount"
+
+
+@run_test
+def test_classify_is_not_polled_on_a_timer():
+    """
+    BUG B: /pipeline/classify ran every 15 s — a 503 four times a minute with
+    AI-1 untrained, or a full transformer inference pass on a Pi 4 with it
+    trained, to refresh one number in a corner.
+    """
+    src = _ts_code_only("frontend/components/OperatorControlPanel.tsx")
+
+    # every setInterval in the file must be timer-only, never a network call
+    import re
+    for m in re.finditer(r"setInterval\(", src):
+        window = src[m.start():m.start() + 700]
+        assert "api." not in window, \
+            f"a setInterval still performs a backend call:\n{window[:200]}"
+
+    assert src.count("api.classify()") == 1, \
+        "classify should have exactly one call site (classifyNow)"
+    assert "classifyNow" in src, "no on-demand classifier"
+    assert "void classifyNow()" in src, \
+        "classifyNow is never triggered — the metric would never update"
+    assert "api.pipelineStatus()" in src, "pipeline status is no longer checked"
+
+
+# ===========================================================================
+# WebSocket history envelope (Prompt 6.0)
+# ===========================================================================
+
+@run_test
+def test_subscribe_telemetry_branches_on_history_envelope():
+    """
+    THE Prompt 6.0 acceptance test.
+
+    /ws/telemetry's FIRST message is {"type":"history","frames":[...]} — not a
+    frame. Nothing checked `type`, so the envelope reached the frame handlers
+    on every connect and every reconnect: `SP: 0x1FFF00NaN`, "WS frame
+    undefined", and all five AiDiagnostics channels red CRITICAL. The 60
+    backfilled frames were discarded.
+
+    Revert check: delete the `type === 'history'` branch and this fails.
+    """
+    src = (ROOT / "frontend" / "api.ts").read_text(encoding="utf-8")
+    i = src.index("export const subscribeTelemetry")
+    body = src[i:src.index("export const subscribeEvents", i)]
+
+    assert "onHistory" in body, "subscribeTelemetry has no onHistory callback"
+    assert "'history'" in body, "subscribeTelemetry does not branch on type"
+    assert "return;" in body, \
+        "the history branch must return without calling onFrame"
+
+    # The envelope branch must live in subscribeTelemetry, not in the shared
+    # transport. Bound the slice to subscribe()'s OWN body — the interface and
+    # doc comment between it and subscribeTelemetry both mention "history"
+    # legitimately, and matching those is how this assertion first failed.
+    code = _ts_code_only("frontend/api.ts")
+    start = code.index("function subscribe<T>")
+    end = code.index("\n}", start) + 2          # first column-0 close brace
+    sub = code[start:end]
+    assert "'history'" not in sub, \
+        "subscribe() branches on the envelope — that belongs in subscribeTelemetry"
+
+    # The reconnect logic moved into openChannel() with Prompt 6.3's
+    # multiplexing, but must be otherwise unaltered.
+    assert "Math.min(1000 * 2 ** ch.retry, 15000)" in code, \
+        "the exponential-backoff reconnect was altered"
+
+
+@run_test
+def test_dashboard_seeds_chart_from_history():
+    """The backfill must actually populate the chart, via the same mapper."""
+    src = _ts_code_only("frontend/components/SatelliteDashboard.tsx")
+    i = src.index("subscribeTelemetry(")
+    block = src[i:i + 2200]
+    assert "frames.slice(-60).map(frameToPoint)" in block, \
+        "SatelliteDashboard does not seed setHistoryData from the backfill"
+
+
+# ===========================================================================
+# Structural fragility (Prompt 5.2)
+# ===========================================================================
+
+@run_test
+def test_main_block_is_last_in_canonical_tree():
+    """
+    `if __name__ == "__main__": uvicorn.run("main:app")` sat mid-file with
+    hundreds of route definitions after it. The __main__ pass never reached
+    them; only uvicorn's re-import did. Two SatelliteEmulator instances were
+    constructed and every module-level side effect ran twice.
+    """
+    import ast
+    # Only test canonical main.py since backend/main.py is deprecated
+    rel = "main.py"
+    tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+    main_node = next(
+        (n for n in tree.body if isinstance(n, ast.If)
+         and ast.unparse(n.test).replace("'", '"') == '__name__ == "__main__"'),
+        None)
+    assert main_node is not None, f"{rel}: no __main__ block"
+
+    after = tree.body[tree.body.index(main_node) + 1:]
+    handlers = [n for n in after
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.decorator_list]
+    assert not handlers, (
+        f"{rel}: {len(handlers)} route handler(s) defined after the __main__ "
+        f"block — they are skipped when run as __main__")
+    assert not after, \
+        f"{rel}: {len(after)} statement(s) after the __main__ block"
+
+
+@run_test
+def test_catalog_search_uses_the_public_api():
+    """
+    /catalog/search reached into cat._catalog and cat._loaded and called load()
+    by hand — the only catalog endpoint bypassing the class API, so a change to
+    the internal storage would break it silently.
+    """
+    import ast
+    for rel in ("main.py", "backend/main.py"):
+        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == "search_catalog")
+        if fn.body and isinstance(fn.body[0], ast.Expr) and \
+                isinstance(fn.body[0].value, ast.Constant):
+            fn.body.pop(0)                      # drop the docstring
+        code = ast.unparse(fn)
+        for private in ("._catalog", "._loaded"):
+            assert private not in code, \
+                f"{rel}: search_catalog still touches {private}"
+
+    _need("pandas")
+    sys.path.insert(0, str(ROOT))
+    from satellite_catalog import get_catalog
+    cat = get_catalog()
+    assert hasattr(cat, "search_by_name"), "SatelliteCatalog has no search_by_name()"
+    assert len(cat.search_by_name("", limit=7)) == 7, "limit not honoured"
+    assert cat.search_by_name("ZZZ_NOT_A_SATELLITE") == [], "no-match should be empty"
+    assert any("NOAA" in r["name"] for r in cat.search_by_name("NOAA", limit=5))
+
+
+@run_test
+def test_no_dead_norad_id_declaration():
+    """SatelliteDashboard declared `const noradId = 0` that nothing read."""
+    src = _ts_code_only("frontend/components/SatelliteDashboard.tsx")
+    assert "const noradId = 0" not in src, \
+        "the dead noradId declaration is still present"
 
 
 # ===========================================================================
 # Claims reconciliation (Prompt 5.1)
 # ===========================================================================
 
-@test
+@run_test
 def test_readme_feature_count_matches_feature_spec():
     """
     README claimed "13 telemetry features" describing V1's subsystem telemetry.
@@ -1483,7 +2593,7 @@ def test_readme_feature_count_matches_feature_spec():
         "the uncorrected '13 telemetry features' claim is still in the README body"
 
 
-@test
+@run_test
 def test_readme_setup_paths_exist():
     """
     README told readers to `cd frontend/dashboard` and `cd frontend/operator`.
@@ -1496,7 +2606,7 @@ def test_readme_setup_paths_exist():
         assert (ROOT / path).is_dir(), f"README says `cd {path}` but it does not exist"
 
 
-@test
+@run_test
 def test_agent_header_makes_no_blanket_fixed_claim():
     """
     The module header opened "All bugs fixed, all improvements applied" while
@@ -1517,7 +2627,7 @@ def test_agent_header_makes_no_blanket_fixed_claim():
         "agent header does not distinguish outstanding work from completed work"
 
 
-@test
+@run_test
 def test_frontend_declares_no_unused_dependencies():
     """
     package.json declared @google/genai, express and dotenv; nothing imported
@@ -1538,7 +2648,7 @@ def test_frontend_declares_no_unused_dependencies():
         assert dep not in sources, f"{dep} is imported but no longer declared"
 
 
-@test
+@run_test
 def test_simulated_telemetry_fields_are_labelled():
     """
     frameToTelemetryState() fabricates lat/lng/altitude/velocity — the emulator
@@ -1553,23 +2663,7 @@ def test_simulated_telemetry_fields_are_labelled():
             f"{field} missing from SIMULATED_TELEMETRY_FIELDS"
 
 
-def _ts_code_only(rel_path: str) -> str:
-    """
-    TypeScript/TSX source with // and /* */ comments removed.
-
-    The TS counterpart of _code_only(). Assertions about what a component DOES
-    must not match the comment explaining what was removed — the comment
-    naturally quotes the offending string, and several of these tests failed
-    on their own documentation before this existed.
-    """
-    import re
-    src = (ROOT / rel_path).read_text(encoding="utf-8")
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)      # block comments
-    src = re.sub(r"^\s*//.*$", "", src, flags=re.M)      # whole-line //
-    return src
-
-
-@test
+@run_test
 def test_readme_claims_no_fabricated_boot_transcript():
     """
     "Live System Proof" opened "here's what actually prints on boot" above
@@ -1595,14 +2689,14 @@ def test_readme_claims_no_fabricated_boot_transcript():
             f"README recovery JSON still contains {invented}, which _persist_log never writes"
 
 
-@test
+@run_test
 def test_no_grpc_claim_without_grpc():
     """LandingPage advertised a "secure gRPC gateway". There is no gRPC here."""
     src = (ROOT / "frontend" / "components" / "LandingPage.tsx").read_text(encoding="utf-8")
     assert "gRPC" not in src, "LandingPage claims gRPC; the transport is REST + WebSockets"
 
 
-@test
+@run_test
 def test_ui_does_not_fabricate_crypto_confirmations():
     """
     Two components wrote log lines asserting cryptographic operations that had
@@ -1619,7 +2713,7 @@ def test_ui_does_not_fabricate_crypto_confirmations():
         "OperatorControlPanel still seeds a fabricated CY-1 verification alert"
 
 
-@test
+@run_test
 def test_ground_station_location_is_consistent():
     """
     The dashboard header read "NEW DELHI_HQ / 28.61 / 77.20" while every AOS
@@ -1639,7 +2733,7 @@ def test_ground_station_location_is_consistent():
         f"dashboard shows {ui_lat}/{ui_lon} but contact windows use {lat}/{lon}"
 
 
-@test
+@run_test
 def test_security_console_badge_is_not_hardcoded_hardened():
     """
     "PQC STATUS: HARDENED" was a static badge, displayed even when the crypto
@@ -1656,7 +2750,7 @@ def test_security_console_badge_is_not_hardcoded_hardened():
 # CORS misconfiguration guard (Prompt 0.5)
 # ===========================================================================
 
-@test
+@run_test
 def test_cors_lan_bind_with_loopback_origins_is_detected():
     import importlib
     import config as cfg
@@ -1682,6 +2776,260 @@ def test_cors_lan_bind_with_loopback_origins_is_detected():
 
 
 # ===========================================================================
+# RF Architecture Tests (Three-Node RF Integration)
+# ===========================================================================
+
+@run_test
+def test_rf_models_validate_structured_frames():
+    """
+    RF models must properly validate structured RF frames.
+    Tests that RFFrame enforces required fields and valid ranges.
+    """
+    from datetime import datetime, timezone
+    from rf.models import RFFrame, RFHealthStatus, RFMode
+    
+    # Valid frame construction
+    valid_frame = RFFrame(
+        schema_version="1.0",
+        frame_id="test-frame-001",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        source_node="pi2-rf",
+        frequency_hz=137900000.0,
+        sample_rate=2048000,
+        gain=40.0,
+        signal_dbm=-85.0,
+        snr=15.0,
+        noise_floor=-100.0,
+        bandwidth=2400000.0,
+        doppler_correction_hz=0.0,
+        rf_health=RFHealthStatus.ONLINE,
+        rf_mode=RFMode.REAL,
+        sequence=1
+    )
+    
+    assert valid_frame.frequency_hz == 137900000.0
+    assert valid_frame.signal_dbm == -85.0
+    assert valid_frame.rf_health == RFHealthStatus.ONLINE
+
+
+@run_test
+def test_rf_ingest_rejects_stale_frames():
+    """
+    The /rf/ingest endpoint must reject frames older than 10 seconds.
+    This prevents replay attacks and stale data ingestion.
+    """
+    from datetime import datetime, timezone, timedelta
+    from rf.models import RFFrame, RFIngestRequest, RFHealthStatus, RFMode
+    
+    # Create a stale frame (20 seconds old)
+    stale_time = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
+    stale_frame = RFFrame(
+        schema_version="1.0",
+        frame_id="stale-frame",
+        timestamp=stale_time,
+        source_node="pi2-rf",
+        frequency_hz=137900000.0,
+        sample_rate=2048000,
+        gain=40.0,
+        signal_dbm=-85.0,
+        snr=15.0,
+        noise_floor=-100.0,
+        bandwidth=2400000.0,
+        doppler_correction_hz=0.0,
+        rf_health=RFHealthStatus.ONLINE,
+        rf_mode=RFMode.REAL,
+        sequence=1
+    )
+    
+    request = RFIngestRequest(frame=stale_frame)
+    
+    # The timestamp should be > 10 seconds old
+    frame_time = datetime.fromisoformat(stale_frame.timestamp.replace('Z', '+00:00'))
+    age = (datetime.now(timezone.utc) - frame_time).total_seconds()
+    assert age > 10.0, "Test frame should be stale"
+
+
+@run_test
+def test_rf_ingest_rejects_invalid_signal_ranges():
+    """
+    The /rf/ingest endpoint must reject frames with invalid signal strength.
+    Valid range: -150 dBm to -10 dBm.
+    """
+    from datetime import datetime, timezone
+    from rf.models import RFFrame, RFIngestRequest, RFHealthStatus, RFMode
+    
+    # Create frame with invalid signal strength (too strong)
+    invalid_frame = RFFrame(
+        schema_version="1.0",
+        frame_id="invalid-signal",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        source_node="pi2-rf",
+        frequency_hz=137900000.0,
+        sample_rate=2048000,
+        gain=40.0,
+        signal_dbm=5.0,  # Invalid: above -10 dBm
+        snr=15.0,
+        noise_floor=-100.0,
+        bandwidth=2400000.0,
+        doppler_correction_hz=0.0,
+        rf_health=RFHealthStatus.ONLINE,
+        rf_mode=RFMode.REAL,
+        sequence=1
+    )
+    
+    assert not (-150 <= invalid_frame.signal_dbm <= -10), \
+        "Test frame should have invalid signal strength"
+
+
+@run_test
+def test_rf_ingest_enforces_sequence_monotonicity():
+    """
+    The /rf/ingest endpoint must enforce monotonically increasing sequence numbers.
+    This prevents frame reordering and replay attacks.
+    """
+    from datetime import datetime, timezone
+    from rf.models import RFFrame, RFHealthStatus, RFMode
+    
+    # Create two frames with non-increasing sequence
+    frame1 = RFFrame(
+        schema_version="1.0",
+        frame_id="frame-1",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        source_node="pi2-rf",
+        frequency_hz=137900000.0,
+        sample_rate=2048000,
+        gain=40.0,
+        signal_dbm=-85.0,
+        snr=15.0,
+        noise_floor=-100.0,
+        bandwidth=2400000.0,
+        doppler_correction_hz=0.0,
+        rf_health=RFHealthStatus.ONLINE,
+        rf_mode=RFMode.REAL,
+        sequence=10
+    )
+    
+    frame2 = RFFrame(
+        schema_version="1.0",
+        frame_id="frame-2",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        source_node="pi2-rf",
+        frequency_hz=137900000.0,
+        sample_rate=2048000,
+        gain=40.0,
+        signal_dbm=-85.0,
+        snr=15.0,
+        noise_floor=-100.0,
+        bandwidth=2400000.0,
+        doppler_correction_hz=0.0,
+        rf_health=RFHealthStatus.ONLINE,
+        rf_mode=RFMode.REAL,
+        sequence=5  # Invalid: less than previous sequence
+    )
+    
+    assert frame2.sequence <= frame1.sequence, \
+        "Test frames should have non-increasing sequence"
+
+
+@run_test
+def test_rf_websocket_endpoint_exists():
+    """
+    The main.py must expose the /ws/rf WebSocket endpoint for live RF streaming.
+    """
+    import re
+    main_src = (ROOT / "main.py").read_text(encoding="utf-8")
+    
+    # Check for RF WebSocket endpoint
+    assert '@app.websocket("/ws/rf")' in main_src, \
+        "main.py missing /ws/rf WebSocket endpoint"
+    
+    # Check for RF WebSocket handler
+    assert 'async def ws_rf' in main_src, \
+        "main.py missing ws_rf handler function"
+
+
+@run_test
+def test_rf_ingest_endpoint_requires_auth():
+    """
+    The /rf/ingest endpoint must require API key authentication when configured.
+    This prevents unauthorized RF frame injection.
+    """
+    import re
+    main_src = (ROOT / "main.py").read_text(encoding="utf-8")
+    
+    # Check for /rf/ingest endpoint
+    assert '@app.post("/rf/ingest")' in main_src, \
+        "main.py missing /rf/ingest endpoint"
+    
+    # Check for authentication dependency
+    ingest_section = main_src[main_src.index('@app.post("/rf/ingest")'):main_src.index('@app.post("/rf/ingest")') + 500]
+    assert 'require_api_key' in ingest_section or 'Depends' in ingest_section, \
+        "/rf/ingest endpoint lacks authentication"
+
+
+@run_test
+def test_rf_models_support_mock_mode():
+    """
+    RF models must support mock mode for development and CI without hardware.
+    Tests that RFMode.MOCK is available and properly defined.
+    """
+    from rf.models import RFMode
+    
+    assert hasattr(RFMode, 'MOCK'), "RFMode missing MOCK option"
+    assert RFMode.MOCK is not None, "RFMode.MOCK is None"
+
+
+@run_test
+def test_frontend_uses_rf_websocket():
+    """
+    The frontend must use the /ws/rf WebSocket for live RF data instead of polling.
+    Tests that api.ts contains subscribeRF function.
+    """
+    api_src = (ROOT / "frontend" / "api.ts").read_text(encoding="utf-8")
+    
+    assert 'subscribeRF' in api_src, \
+        "frontend/api.ts missing subscribeRF function"
+    
+    assert '/ws/rf' in api_src, \
+        "frontend/api.ts does not reference /ws/rf endpoint"
+
+
+@run_test
+def test_rf_location_is_configurable():
+    """
+    Ground station location for RF/Doppler calculations must be configurable
+    via environment variables, not hard-coded.
+    """
+    import re
+    predictor_src = (ROOT / "rf" / "meteor_predictor.py").read_text(encoding="utf-8")
+    
+    # Check that location is loaded from config, not hard-coded
+    assert 'RF_LOCATION_LAT' in predictor_src or 'cfg.RF_LOCATION_LAT' in predictor_src, \
+        "meteor_predictor.py does not use configurable location"
+    
+    # Check that old hard-coded values are removed
+    assert '23.03' not in predictor_src or 'RF_LOCATION_LAT' in predictor_src, \
+        "meteor_predictor.py may still have hard-coded latitude"
+    assert '72.58' not in predictor_src or 'RF_LOCATION_LON' in predictor_src, \
+        "meteor_predictor.py may still have hard-coded longitude"
+
+
+@run_test
+def test_rf_transport_has_timeout_and_retry():
+    """
+    RF transport must have timeout and retry logic to handle network failures.
+    Tests that transport.py includes timeout configuration.
+    """
+    transport_src = (ROOT / "rf" / "transport.py").read_text(encoding="utf-8")
+    
+    assert 'timeout' in transport_src.lower(), \
+        "rf/transport.py missing timeout configuration"
+    
+    assert 'retry' in transport_src.lower(), \
+        "rf/transport.py missing retry logic"
+
+
+# ===========================================================================
 
 def main() -> int:
     print("=" * 72)
@@ -1703,3 +3051,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

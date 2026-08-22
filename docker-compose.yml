@@ -1,0 +1,78 @@
+# Backend + AI-1 + AI-2 + crypto (CY-1), containerized. See Dockerfile for
+# why this is one image/service rather than three.
+#
+# NOT included here (by design, see README "Getting Started"):
+#   * frontend/      — run it separately with `cd frontend && npm run dev`.
+#                       It talks to this stack over the published port below
+#                       (frontend/.env's VITE_API_BASE=http://localhost:8000
+#                       already matches).
+#   * rf/spectrum_display.py (Pi #2) — needs a physical RTL-SDR device;
+#                       containerizing a USB SDR is its own project.
+#
+# Quick start:
+#   cp .env.example .env      # if you haven't already
+#   docker compose up --build
+#   curl localhost:8000/pipeline/status
+#
+# If /pipeline/status reports artifacts_ready: false (model_artifacts/ was
+# .gitignore'd out of a fresh clone — see Dockerfile), train once inside the
+# running container:
+#   docker compose exec backend python generate_dataset.py --propagator sgp4 --verify
+#   docker compose exec backend python train_classifier.py
+#   docker compose restart backend
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Published for convenience (e.g. redis-cli from the host); the backend
+    # reaches it over the internal compose network by service name (see
+    # DEADSAT_REDIS_HOST below), so this port is optional either way.
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      # Everything EXCEPT the two overrides below (DEADSAT_REDIS_HOST/PORT)
+      # comes from your own .env — same file the non-Docker setup uses.
+      - .env
+    environment:
+      # nonce.py defaulted these to 'localhost' for years because every
+      # documented deployment ran redis on the same box as the API process
+      # (see crypto/nonce.py). In Compose, redis is a separate container
+      # reachable only by its service name — these two overrides are the
+      # fix, and they take priority over whatever's in .env.
+      DEADSAT_REDIS_HOST: redis
+      DEADSAT_REDIS_PORT: "6379"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # No curl/wget in the slim base image (see Dockerfile) — Python's own
+      # urllib does the same job without adding a package.
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:8000/pipeline/status', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    volumes:
+      # Swap in a newly-trained model without rebuilding the image: retrain
+      # on the host (or via `docker compose exec backend ...`, which writes
+      # into this same mounted directory) and `docker compose restart
+      # backend` to load it.
+      - ./model_artifacts:/app/model_artifacts
+
+volumes:
+  redis_data:

@@ -143,14 +143,16 @@ export default function OperatorPanel() {
             `  CY-1             ${s.cy1_online ? 'ONLINE' : 'OFFLINE'}\n` +
             `  mode             ${s.mode}\n` +
             `  endpoint         ${s.endpoint}\n` +
-            `  ledger entries   ${(l.entries || []).length}\n` +
-            `  open alerts      ${(a.alerts || []).length}`,
+            // The crypto router returns bare arrays; the removed proxy handlers
+            // returned {entries}/{alerts}. Accept both, or these read 0 always.
+            `  ledger entries   ${(Array.isArray(l) ? l : l?.entries || []).length}\n` +
+            `  open alerts      ${(Array.isArray(a) ? a : a?.alerts || []).length}`,
             s.cy1_online ? 'success' : 'error');
           break;
         }
         case 'ledger': {
           const l: any = await api.cryptoLedger();
-          const rows = (l.entries || []).slice(-10);
+          const rows = (Array.isArray(l) ? l : l?.entries || []).slice(-10);
           push(cmd, rows.length
             ? rows.map((r: any) => `  #${r.id} ${r.timestamp} ${String(r.cmd_hash).slice(0, 16)}… op=${r.operator}`).join('\n')
             : '  (ledger empty or CY-1 offline)', rows.length ? 'success' : 'error');

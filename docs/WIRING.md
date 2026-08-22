@@ -1,35 +1,62 @@
 # DeadSat Resurrection — Wiring & Deployment
 
-How the pieces connect, and how to bring the two-Raspberry-Pi setup up.
+How the pieces connect, and how to bring the three-machine RF architecture up.
 
 ---
 
 ## Topology
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Pi #1 — Raspberry Pi 4 Model B        :8000    │
-│                                                 │
-│   SatelliteEmulator ──▶ AI-1 classifier         │
-│          ▲                    │                 │
-│          │                    ▼                 │
-│          └──── AI-2 recovery agent (LangGraph)  │
-│                       │                         │
-│                       ▼                         │
-│                 Crypto layer  ──▶ CY-1  :8001   │
-│                 (sign / verify / ledger)        │
-└─────────────────────────────────────────────────┘
-        │  /rf/status (proxy)        ▲  /ws/telemetry
-        ▼                            │  /ws/events
-┌──────────────────────┐   ┌──────────────────────┐
-│ Pi #2 — RF station   │   │ Operator browser     │
-│   RTL-SDR     :8002  │   │   VITE_API_BASE      │
-└──────────────────────┘   └──────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Pi #1 — Core Node (Raspberry Pi 4 Model B)           :8000     │
+│                                                                 │
+│   SatelliteEmulator ──▶ AI-1 classifier                         │
+│          ▲                    │                                  │
+│          │                    ▼                                  │
+│          └──── AI-2 recovery agent (LangGraph)                   │
+│                       │                                           │
+│                       ▼                                           │
+│                 Crypto layer  ──▶ CY-1                 :8001     │
+│                 (sign / verify / ledger)                          │
+│                                                                 │
+│   RF ingest  ◄───────┐                                          │
+│   /rf/ingest          │   RF frame transport over Ethernet      │
+│   /ws/rf              │                                          │
+└──────────────────────┼──────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Pi #2 — RF Node (Raspberry Pi 4 Model B)            :8002     │
+│                                                                 │
+│   RTL-SDR hardware ──▶ RF acquisition ──▶ Basic DSP                 │
+│                             │                                    │
+│                             ▼                                    │
+│                     Doppler correction                           │
+│                             │                                    │
+│                             ▼                                    │
+│                     Signal metrics                               │
+│                             │                                    │
+│                             ▼                                    │
+│                     Structured RF frames                         │
+│                             │                                    │
+│                             ▼                                    │
+│                     Transport to Pi #1                           │
+└─────────────────────────────────────────────────────────────────┘
+        ▲  /ws/telemetry  ▲  /ws/rf  ▲  /ws/events
+        │                │           │
+        └────────────────┴───────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Laptop — Operator Dashboard                           :3000     │
+│                                                                 │
+│   React/Vite frontend                                            │
+│   HTTP + WebSocket communication to Pi #1 only                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-The browser only ever talks to **Pi #1**. The RF station on Pi #2 is proxied
-through `/rf/status` and `/rf/spectrum`, so there is one origin to configure
-and no CORS relationship with the second Pi.
+The browser only ever talks to **Pi #1**. Pi #2 streams RF frames to Pi #1
+via the transport layer, and Pi #1 broadcasts RF updates to the frontend via
+`/ws/rf`. This eliminates direct browser-to-Pi #2 communication and simplifies
+CORS configuration.
 
 ---
 
@@ -42,8 +69,9 @@ and no CORS relationship with the second Pi.
 | AI-2 → crypto (sign) | HTTP | `config.CRYPTO_SIGN_URL` |
 | AI-2 → crypto (verify) | HTTP | `config.CRYPTO_VERIFY_URL` — **gate before execution** |
 | Crypto → CY-1 | HTTP | `config.CY1_BASE` (`:8001`) |
-| Pi #1 → Pi #2 RF | HTTP | `config.RF_BASE` (`:8002`) |
-| Frontend → Pi #1 | HTTP + WS | `VITE_API_BASE` |
+| Pi #2 → Pi #1 (RF frames) | HTTP POST | `POST /rf/ingest` on Pi #1 (via `rf/transport.py`) |
+| Pi #1 → Frontend (RF live) | WebSocket | `WS /ws/rf` on Pi #1 |
+| Frontend → Pi #1 | HTTP + WS | `VITE_API_BASE` (telemetry, events, crypto, etc.) |
 
 Check every link at runtime:
 
@@ -69,7 +97,7 @@ with an `n/m` link count; hover it for per-link detail.
 
 ## Setup
 
-### Pi #1 — AI + crypto
+### Pi #1 — Core Node (AI + crypto + RF ingest + database)
 
 ```bash
 cp .env.example .env
@@ -78,9 +106,12 @@ cp .env.example .env
 ```ini
 DEADSAT_API_HOST="0.0.0.0"           # accept LAN traffic
 DEADSAT_PUBLIC_HOST="192.168.1.50"   # this Pi's LAN address
-DEADSAT_RF_BASE="http://192.168.1.51:8002"
+DEADSAT_RF_CORE_URL="http://0.0.0.0:8000"  # Pi #1 receives RF frames here
 DEADSAT_CORS_ORIGINS="http://192.168.1.60:3000"
 DEADSAT_API_KEY="pick-a-long-random-string"
+
+# RF device mode (for Core node ingest validation)
+DEADSAT_RF_DEVICE_MODE="validate"    # Pi #1 validates RF frames
 ```
 
 ```bash
@@ -93,7 +124,7 @@ rather than mid-demo:
 
 ```
 [Config]   API base     : http://192.168.1.50:8000
-[Config]   RF station   : http://192.168.1.51:8002
+[Config]   RF Core URL  : http://0.0.0.0:8000
 [Config]   Verify gate  : ON
 [Config]   Mock signing : BLOCKED
 ```
@@ -103,15 +134,49 @@ rather than mid-demo:
 > 2-layer, `d_model=64` transformer over an 8-step window — fine on a Pi 4.
 > Training is not.
 
-### Pi #2 — RF ground station
+### Pi #2 — RF Node (RTL-SDR acquisition + transport)
 
 ```bash
-python -m uvicorn rf_service:app --host 0.0.0.0 --port 8002
+cp .env.example .env
 ```
 
-Only needs to expose `/rf/status` (and optionally `/rf/spectrum`). Pi #1
-tolerates it being offline — `/rf/status` returns `{"online": false, ...}`
-after a 3 s timeout rather than hanging the dashboard.
+```ini
+DEADSAT_RF_NODE_HOST="0.0.0.0"          # accept LAN traffic
+DEADSAT_RF_NODE_PORT="8002"            # RF service port
+DEADSAT_RF_CORE_URL="http://192.168.1.50:8000"  # Pi #1 Core URL
+DEADSAT_RF_API_KEY="pick-a-long-random-string"  # Must match Pi #1
+
+# RF device configuration
+DEADSAT_RF_DEVICE_MODE="real"           # Use real RTL-SDR hardware
+DEADSAT_RF_FREQUENCY_HZ="137900000"    # 137.9 MHz
+DEADSAT_RF_SAMPLE_RATE="2048000"       # 2.048 MSPS
+DEADSAT_RF_GAIN="40"                    # 40 dB
+DEADSAT_RF_PPM="0"                     # PPM correction
+
+# Ground station location (for Doppler calculation)
+DEADSAT_RF_LOCATION_LAT="23.03"
+DEADSAT_RF_LOCATION_LON="72.58"
+DEADSAT_RF_LOCATION_ALT_M="53"
+
+# Transport configuration
+DEADSAT_RF_TRANSPORT_TIMEOUT_S="5"
+DEADSAT_RF_TRANSPORT_QUEUE_SIZE="100"
+DEADSAT_RF_TRANSPORT_INTERVAL_S="0.1"
+```
+
+```bash
+pip install -r requirements.txt
+python -m uvicorn rf.service:app --host 0.0.0.0 --port 8002
+```
+
+Pi #2 runs the standalone RF service that:
+- Acquires samples from RTL-SDR hardware
+- Performs basic DSP and Doppler correction
+- Generates structured RF frames
+- Transports frames to Pi #1 via `POST /rf/ingest`
+
+For development without hardware, set `DEADSAT_RF_DEVICE_MODE="mock"` to use
+the mock RF source.
 
 ### Operator machine — frontend
 
@@ -276,18 +341,29 @@ Full explanation in [CORS — the one that will bite you on demo day](#cors--the
 `:8001`. Start it, point `DEADSAT_CY1_BASE` at it, or — for a bench run only —
 set `DEADSAT_REQUIRE_VERIFICATION=0`.
 
-**RF panel shows offline.** Expected when Pi #2 is down. Confirm with
-`curl http://<PI2>:8002/rf/status` and check `DEADSAT_RF_BASE`.
+**RF panel shows offline.** Expected when Pi #2 is down or the RF WebSocket
+is disconnected. Check:
+- Pi #2 RF service: `curl http://<PI2>:8002/health`
+- Pi #1 RF ingest: `curl http://<PI1>:8000/rf/status`
+- WebSocket connection in browser dev tools (`/ws/rf`)
+- `DEADSAT_RF_CORE_URL` and `DEADSAT_RF_NODE_HOST` configuration
 
 **Pipeline runs but AI-1 is skipped.** `model_artifacts/` is missing. Check
 `/pipeline/status`; train on a laptop and copy the directory over.
 
 ---
 
-## Note on the duplicated tree
+## Note on the deprecated backend/ tree
 
-`backend/` remains a parallel copy of the application, so every change here was
-applied twice: `emulator/` ↔ `backend/emulator/`, `agents/` ↔ `backend/agents/`,
-`models/` ↔ `backend/pipeline/`, `main.py` ↔ `backend/main.py`, plus
-`config.py` ↔ `backend/config.py`. See `docs/FIX_PRIORITY.md` P1-14 for the
-proposed drift guard.
+The `backend/` directory tree is now **deprecated**. The canonical backend is
+the root `main.py`. The `backend/` tree is preserved for reference only and
+should not be used in production.
+
+See `backend/DEPRECATED.md` for details on why this was retired and what the
+migration path is. The `test_backend_sync.py` test now verifies that:
+
+1. `backend/DEPRECATED.md` exists
+2. No active code imports from `backend/`
+3. The canonical `main.py` is the authoritative backend
+
+This prevents accidental use of the deprecated backend tree.

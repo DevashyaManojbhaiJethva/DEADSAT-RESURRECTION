@@ -162,7 +162,21 @@ export default function AiDiagnostics() {
         <div className="border-t border-white/10 pt-6 mt-6 flex flex-col sm:flex-row items-center justify-between gap-4 font-mono">
           <div>
             <div className="text-[10px] text-[#D4D4D4] uppercase font-bold tracking-wider">Classification Confidence</div>
-            <div className="text-2xl font-black text-signal-green tracking-widest">{confidenceScore}%</div>
+            <div className={`text-2xl font-black tracking-widest ${artifactsReady ? 'text-signal-green' : 'text-[#D4D4D4]/40'}`}>
+              {confidenceScore}%
+            </div>
+            {/* lastClass, artifactsReady and statusHint were all fetched and
+                discarded. Without them a 0% from an untrained model looked
+                identical to a 0% from a confident classification. */}
+            {lastClass && lastClass !== '—' && (
+              <div className="text-[10px] text-data-blue mt-1 tracking-wider">{lastClass}</div>
+            )}
+            {statusHint && (
+              <div className={`text-[10px] mt-1 leading-relaxed max-w-sm ${artifactsReady ? 'text-[#D4D4D4]/50' : 'text-threat-red'}`}>
+                {artifactsReady === false && <span className="font-bold">AI-1 NOT TRAINED — </span>}
+                {statusHint}
+              </div>
+            )}
           </div>
 
           <button 

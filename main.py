@@ -11,10 +11,14 @@ REST Endpoints:
   POST /recovery/trigger   — AI-1 calls this when fault is classified
   POST /recovery/uplink    — Internal: agent notifies backend of uplink
   POST /reset              — Reset satellite to nominal
+  POST /rf/ingest          — Pi #2 RF frame ingestion (canonical RF endpoint)
+  GET  /rf/status          — RF ground station status (proxy to Pi #2)
+  GET  /rf/spectrum        — RF spectrum data (proxy to Pi #2)
 
 WebSocket Endpoints (FIX 4 & 5):
   WS   /ws/telemetry       — FE-1 live charts: pushes TM frame every 1s
   WS   /ws/events          — FE-2 recovery status: pushes agent events in real time
+  WS   /ws/rf              — RF data streaming: pushes live RF frames from Pi #2
 """
 
 from dotenv import load_dotenv
@@ -31,17 +35,24 @@ import httpx          # WIRING: used by the RF bridge to reach Pi #2
 from concurrent.futures import ThreadPoolExecutor
 import sys
 import json
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
+from history_privacy import Requester, current_context, filter_event, filter_history, audit_log, VALID_INTENTS
+from jwt_auth import JWTValidationError, authenticate_jwt, issue_jwt, verify_scrypt_password
+from privacy_audit import PrivacyAuditStore
 
 sys.path.append(str(Path(__file__).parent / "emulator"))
 sys.path.append(str(Path(__file__).parent / "agent"))
 sys.path.append(str(Path(__file__).parent / "agents"))   # correct folder name
 sys.path.append(str(Path(__file__).parent / "crypto"))   # CY-1 hybrid crypto layer
+sys.path.append(str(Path(__file__).parent / "rf"))       # RF acquisition models
 
 import os
 from satellite_emulator import SatelliteEmulator, FaultType, seed_from_real_data
 from real_data_fetcher import RealDataFetcher, NOAA_18_ID
+from rf.models import RFFrame, RFIngestRequest, RFIngestResponse, RFHealthStatus
+from rf.intelligence import process_rf_frame_for_intelligence
 
 # SECURITY / WIRING: the real hybrid Ed25519 + ML-DSA-65 implementation.
 #
@@ -56,7 +67,7 @@ from real_data_fetcher import RealDataFetcher, NOAA_18_ID
 # Mounting the router makes Pi #1 the crypto authority in-process. CY1_BASE
 # remains configurable for a split deployment, but recovery no longer depends
 # on a second process being up.
-from crypto_routes import router as crypto_router, startup_crypto  # noqa: E402
+from crypto_routes import router as crypto_router, startup_crypto, rotate_keypair  # noqa: E402
 
 # N2YO API key — set via env var or hardcode after registering at n2yo.com
 N2YO_API_KEY  = os.environ.get("N2YO_API_KEY", "")
@@ -71,45 +82,57 @@ class ConnectionManager:
     """Manages all active WebSocket connections per channel."""
 
     def __init__(self):
-        self.telemetry_clients: list[WebSocket] = []
-        self.events_clients:    list[WebSocket] = []
+        self.telemetry_clients: list[tuple[WebSocket, Requester, str]] = []
+        self.events_clients:    list[tuple[WebSocket, Requester]] = []
+        self.rf_clients:        list[WebSocket] = []
         self._lock = asyncio.Lock()
 
-    async def connect_telemetry(self, ws: WebSocket):
+    async def connect_telemetry(self, ws: WebSocket, requester: Requester, intent: str):
         # NOTE: the socket is accepted by _ws_authenticate() before this is
         # called — accepting twice raises. Auth must happen before a client is
         # registered for broadcasts, or an unauthenticated socket would receive
         # frames in the window before it was closed.
         async with self._lock:
-            self.telemetry_clients.append(ws)
+            self.telemetry_clients.append((ws, requester, intent))
         print(f"[WS] Telemetry client connected. Total: {len(self.telemetry_clients)}")
 
-    async def connect_events(self, ws: WebSocket):
+    async def connect_events(self, ws: WebSocket, requester: Requester):
         async with self._lock:
-            self.events_clients.append(ws)
+            self.events_clients.append((ws, requester))
         print(f"[WS] Events client connected. Total: {len(self.events_clients)}")
+
+    async def connect_rf(self, ws: WebSocket):
+        async with self._lock:
+            self.rf_clients.append(ws)
+        print(f"[WS] RF client connected. Total: {len(self.rf_clients)}")
 
     async def disconnect_telemetry(self, ws: WebSocket):
         async with self._lock:
-            if ws in self.telemetry_clients:
-                self.telemetry_clients.remove(ws)
+            self.telemetry_clients = [client for client in self.telemetry_clients if client[0] is not ws]
         print(f"[WS] Telemetry client disconnected. Remaining: {len(self.telemetry_clients)}")
 
     async def disconnect_events(self, ws: WebSocket):
         async with self._lock:
-            if ws in self.events_clients:
-                self.events_clients.remove(ws)
+            self.events_clients = [client for client in self.events_clients if client[0] is not ws]
         print(f"[WS] Events client disconnected. Remaining: {len(self.events_clients)}")
+
+    async def disconnect_rf(self, ws: WebSocket):
+        async with self._lock:
+            if ws in self.rf_clients:
+                self.rf_clients.remove(ws)
+        print(f"[WS] RF client disconnected. Remaining: {len(self.rf_clients)}")
 
     async def broadcast_telemetry(self, data: dict):
         """Push latest TM frame to all FE-1 chart clients."""
         if not self.telemetry_clients:
             return
-        msg = json.dumps(data)
         dead = []
-        for ws in list(self.telemetry_clients):
+        context = current_context(data)
+        for ws, requester, intent in list(self.telemetry_clients):
             try:
-                await ws.send_text(msg)
+                permitted = filter_event(data, requester, intent, context, audit=False)
+                if permitted is not None:
+                    await ws.send_text(json.dumps(permitted))
             except Exception:
                 dead.append(ws)
         for ws in dead:
@@ -125,13 +148,27 @@ class ConnectionManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         dead = []
-        for ws in list(self.events_clients):
+        for ws, _requester in list(self.events_clients):
             try:
                 await ws.send_text(msg)
             except Exception:
                 dead.append(ws)
         for ws in dead:
             await self.disconnect_events(ws)
+
+    async def broadcast_rf(self, frame: RFFrame):
+        """Push RF frame to all RF dashboard clients."""
+        if not self.rf_clients:
+            return
+        msg = frame.model_dump_json()
+        dead = []
+        for ws in list(self.rf_clients):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            await self.disconnect_rf(ws)
 
 
 ws_manager = ConnectionManager()
@@ -144,10 +181,18 @@ ws_manager = ConnectionManager()
 # from config.py so the same code runs on a laptop and on the two-Pi split.
 import config as cfg
 
+# Metadata-only audit records persist independently of the emulator's real
+# telemetry ring buffer.  No historical frame payload is stored here.
+audit_log.configure(PrivacyAuditStore(cfg.PRIVACY_AUDIT_DB))
+
 emulator = SatelliteEmulator(tick_interval=cfg.EMULATOR_TICK_S,
                              norad_id=cfg.DEFAULT_NORAD_ID)
 _fetcher: Optional[RealDataFetcher] = None
 _fetcher_lock = threading.Lock()
+
+# RF frame storage for latest frame from Pi #2
+_latest_rf_frame: Optional[RFFrame] = None
+_rf_frame_lock = threading.Lock()
 
 
 def get_fetcher() -> RealDataFetcher:
@@ -265,6 +310,54 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 
+def _requester_from_api_key(supplied_key: Optional[str]) -> Requester:
+    """Bind history access to the existing credential, never a caller-supplied role."""
+    if cfg.API_KEY:
+        if supplied_key != cfg.API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+        fingerprint = hashlib.sha256(cfg.API_KEY.encode("utf-8")).hexdigest()[:16]
+        return Requester(f"api-key:{fingerprint}", True, frozenset({"history:read"}),
+                         role="legacy_api_key", authentication="api_key")
+    # An open bench has no authenticatable person. Sensitive frames remain
+    # redacted; deployments set DEADSAT_API_KEY for attributable access.
+    return Requester("unauthenticated-bench", False, frozenset(), authentication="none")
+
+
+def _requester_from_authorization(authorization: Optional[str], x_api_key: Optional[str]) -> Requester:
+    """Prefer a verified JWT identity; retain the API key only as legacy fallback."""
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(status_code=401, detail="Invalid authorization header")
+        try:
+            return authenticate_jwt(token, secret=cfg.JWT_SECRET, issuer=cfg.JWT_ISSUER,
+                                    audience=cfg.JWT_AUDIENCE)
+        except JWTValidationError as exc:
+            raise HTTPException(status_code=401, detail="Invalid or expired access token") from exc
+    return _requester_from_api_key(x_api_key)
+
+
+def _bearer_requester(authorization: Optional[str]) -> Requester:
+    """JWT-only identity for login-derived security operations."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Bearer access token is required")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    try:
+        return authenticate_jwt(token, secret=cfg.JWT_SECRET, issuer=cfg.JWT_ISSUER,
+                                audience=cfg.JWT_AUDIENCE)
+    except JWTValidationError as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token") from exc
+
+
+def _history_intent(intent: Optional[str]) -> str:
+    selected = (intent or "monitoring").strip().lower()
+    if selected not in VALID_INTENTS:
+        raise HTTPException(status_code=422, detail="Unsupported history intent")
+    return selected
+
+
 async def _ws_authenticate(websocket: WebSocket) -> bool:
     """
     Shared-secret guard for WebSocket endpoints.
@@ -325,6 +418,38 @@ async def _ws_authenticate(websocket: WebSocket) -> bool:
 # Request Models
 # ──────────────────────────────────────────────
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    """Authenticate a deployment-configured operator and issue a signed JWT."""
+    user = cfg.AUTH_USERS.get(request.username)
+    password_hash = user.get("password_hash") if user else None
+    if not isinstance(password_hash, str) or not verify_scrypt_password(request.password, password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    subject, role = user.get("sub", request.username), user.get("role", "operator")
+    permissions = user.get("permissions", [])
+    if (not cfg.JWT_SECRET or not isinstance(subject, str) or not isinstance(role, str) or
+            not isinstance(permissions, list) or not all(isinstance(item, str) for item in permissions)):
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    token = issue_jwt(subject=subject, role=role, permissions=permissions, secret=cfg.JWT_SECRET,
+                      expires_in=cfg.JWT_TTL_S, issuer=cfg.JWT_ISSUER, audience=cfg.JWT_AUDIENCE)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/auth/ws-token")
+async def websocket_token(authorization: Optional[str] = Header(default=None)):
+    """Exchange a bearer session for a short-lived, WebSocket-only JWT."""
+    requester = _bearer_requester(authorization)
+    token = issue_jwt(subject=requester.identifier, role=requester.role,
+                      permissions=requester.permissions, secret=cfg.JWT_SECRET,
+                      expires_in=cfg.JWT_WS_TTL_S, token_type="websocket",
+                      issuer=cfg.JWT_ISSUER, audience=cfg.JWT_AUDIENCE)
+    return {"connection_token": token, "token_type": "websocket", "expires_in": cfg.JWT_WS_TTL_S}
+
 class FaultInjectRequest(BaseModel):
     fault_type:   str
     sat_register: Optional[str] = Field(default="0x3F", alias="register")
@@ -345,6 +470,27 @@ class UplinkNotifyRequest(BaseModel):
     ts:             str  = ""
 
 
+async def _ws_history_requester(websocket: WebSocket, *, allow_legacy: bool = True) -> Optional[Requester]:
+    """Authenticate a socket with a short-lived, purpose-bound connection JWT."""
+    token = websocket.query_params.get("connection_token")
+    if token:
+        await websocket.accept()
+        try:
+            return authenticate_jwt(token, secret=cfg.JWT_SECRET, issuer=cfg.JWT_ISSUER,
+                                    audience=cfg.JWT_AUDIENCE,
+                                    expected_token_type="websocket")
+        except JWTValidationError:
+            await websocket.close(code=1008, reason="Invalid or expired access token")
+            return None
+    if not allow_legacy:
+        await websocket.accept()
+        await websocket.close(code=1008, reason="Authenticated connection token is required")
+        return None
+    if not await _ws_authenticate(websocket):
+        return None
+    return _requester_from_api_key(cfg.API_KEY if cfg.API_KEY else None)
+
+
 # ──────────────────────────────────────────────
 # REST Endpoints
 # ──────────────────────────────────────────────
@@ -358,10 +504,27 @@ async def get_telemetry():
 
 
 @app.get("/telemetry/history")
-async def get_telemetry_history(n: int = 60):
-    """AI-1 classifier calls this for the sliding window (default 60 real frames)."""
+async def get_telemetry_history(n: int = 60, intent: str = "monitoring",
+                                x_api_key: Optional[str] = Header(default=None),
+                                authorization: Optional[str] = Header(default=None)):
+    """Return real ring-buffer frames after per-event privacy filtering."""
+    requester = _requester_from_authorization(authorization, x_api_key)
+    if "history:read" not in requester.permissions:
+        raise HTTPException(status_code=403, detail="History access is not permitted")
+    intent = _history_intent(intent)
     history = emulator.get_frame_history(last_n=n)
-    return {"frames": history, "count": len(history)}
+    context = current_context(emulator.get_latest_frame())
+    frames = filter_history(history, requester, intent, context)
+    return {"frames": frames, "count": len(frames), "intent": intent, "context": context.state}
+
+
+@app.get("/privacy/audit")
+async def get_privacy_audit(limit: int = 100, authorization: Optional[str] = Header(default=None)):
+    """Read real persisted privacy decisions; never exposes telemetry payloads."""
+    requester = _requester_from_authorization(authorization, None)
+    if "privacy:audit:read" not in requester.permissions:
+        raise HTTPException(status_code=403, detail="Privacy audit access is not permitted")
+    return {"records": audit_log.records(limit), "count": len(audit_log.records(limit))}
 
 
 @app.get("/contact")
@@ -402,6 +565,10 @@ async def inject_fault(req: FaultInjectRequest, _auth: None = Depends(require_ap
         emulator.inject_firmware_corruption()
     elif ft == "command_injection":
         emulator.inject_command(payload=req.payload or "ROGUE_CMD_0xDEAD")
+    elif ft == "battery_failure":
+        emulator.inject_battery_failure()
+    elif ft == "adcs_failure":
+        emulator.inject_adcs_failure()
     else:
         raise HTTPException(status_code=400, detail=f"Unknown fault type: {req.fault_type}")
 
@@ -645,19 +812,38 @@ async def crypto_status():
 @app.post("/crypto/rotate")
 async def crypto_rotate(_auth: None = Depends(require_api_key)):
     """
-    WIRING: ask CY-1 to rotate its signing keypair. Returns an honest failure
-    when CY-1 is offline — the Security Console previously reported a
-    successful rotation after a 2.5 s client-side timer with no service call.
+    Rotate the crypto layer's signing keypair.
+
+    WIRING: this used to unconditionally proxy to CY1_BASE (a standalone
+    CY-1 service on its own host/port) and fail with 503 CY-1 UNREACHABLE
+    whenever nothing answered there — which is EVERY deployment this
+    codebase actually runs, single-machine or Docker included, because
+    crypto is mounted IN-PROCESS via crypto_router (see the comment block
+    above, "Mounting the router makes Pi #1 the crypto authority
+    in-process"). No standalone CY-1 service exists anywhere in this repo.
+    The Security Console's "Rotate Keys" button was therefore permanently
+    broken for every documented setup.
+
+    Now: still try the external CY1_BASE first, for the split two-Pi
+    deployment this endpoint was originally written for if anyone ever
+    stands one up, then fall back to rotating the in-process keypair
+    directly — which is what every actual deployment of this project needs.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.post(f"{cfg.CY1_BASE}/rotate")
             resp.raise_for_status()
-            return {"rotated": True, "detail": resp.json()}
+            return {"rotated": True, "detail": resp.json(), "via": "external_cy1"}
+    except Exception:
+        pass  # no standalone CY-1 reachable — fall through to in-process rotation
+
+    try:
+        detail = rotate_keypair()
+        return {"rotated": True, "detail": detail, "via": "in_process"}
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"CY-1 unavailable at {cfg.CY1_BASE} — key rotation not performed ({e})",
+            detail=f"Key rotation failed — in-process rotation raised: {e}",
         )
 
 
@@ -677,16 +863,28 @@ async def ws_telemetry(websocket: WebSocket):
     _ws_authenticate(). Live telemetry is exactly what the key is meant to
     protect, and this socket used to hand it to anyone who asked.
     """
-    if not await _ws_authenticate(websocket):
+    requester = await _ws_history_requester(websocket)
+    if requester is None:
         return
-    await ws_manager.connect_telemetry(websocket)
+    if "history:read" not in requester.permissions:
+        await websocket.close(code=1008, reason="History access is not permitted")
+        return
+    try:
+        intent = _history_intent(websocket.query_params.get("intent"))
+    except HTTPException:
+        await websocket.close(code=1008, reason="Unsupported history intent")
+        return
+    await ws_manager.connect_telemetry(websocket, requester, intent)
     try:
         # Send history immediately on connect so FE-1 charts aren't empty
-        history = emulator.get_frame_history(60)
+        context = current_context(emulator.get_latest_frame())
+        history = filter_history(emulator.get_frame_history(60), requester, intent, context)
         await websocket.send_text(json.dumps({
             "type":   "history",
             "frames": history,
             "count":  len(history),
+            "intent": intent,
+            "context": context.state,
         }))
         # Keep connection alive — broadcaster handles pushes
         while True:
@@ -703,13 +901,16 @@ async def ws_events(websocket: WebSocket):
     FIX 5: WebSocket for FE-2 recovery status updates.
     Pushes: fault_injected | recovery_started | uplink_sent | recovery_complete | satellite_reset
 
-    Requires the shared secret when DEADSAT_API_KEY is set — see
-    _ws_authenticate(). This stream narrates every recovery, including which
-    procedures were uplinked and when.
+    Requires a verified, short-lived WebSocket JWT. A legacy shared key cannot
+    access this recovery/security event stream.
     """
-    if not await _ws_authenticate(websocket):
+    requester = await _ws_history_requester(websocket, allow_legacy=False)
+    if requester is None:
         return
-    await ws_manager.connect_events(websocket)
+    if "history:read" not in requester.permissions:
+        await websocket.close(code=1008, reason="Event stream access is not permitted")
+        return
+    await ws_manager.connect_events(websocket, requester)
     try:
         while True:
             await websocket.receive_text()   # heartbeat
@@ -717,6 +918,38 @@ async def ws_events(websocket: WebSocket):
         await ws_manager.disconnect_events(websocket)
     except Exception:
         await ws_manager.disconnect_events(websocket)
+
+
+@app.websocket("/ws/rf")
+async def ws_rf(websocket: WebSocket):
+    """
+    RF data streaming WebSocket for live dashboard visualization.
+    
+    Pushes RF frames from Pi #2 as they are ingested via /rf/ingest.
+    Provides real-time RF telemetry without polling overhead.
+    
+    Requires the shared secret when DEADSAT_API_KEY is set — see
+    _ws_authenticate().
+    """
+    if not await _ws_authenticate(websocket):
+        return
+    await ws_manager.connect_rf(websocket)
+    
+    # Send latest frame immediately if available
+    with _rf_frame_lock:
+        if _latest_rf_frame:
+            try:
+                await websocket.send_text(_latest_rf_frame.model_dump_json())
+            except Exception:
+                pass
+    
+    try:
+        while True:
+            await websocket.receive_text()   # heartbeat
+    except WebSocketDisconnect:
+        await ws_manager.disconnect_rf(websocket)
+    except Exception:
+        await ws_manager.disconnect_rf(websocket)
 
 
 
@@ -807,7 +1040,17 @@ async def get_all_baselines():
 
 sys.path.append(str(Path(__file__).parent / "models"))
 
-PIPELINE_FAULT_TYPES = ["SEU", "software_bug", "firmware_corruption", "command_injection"]
+# Faults the pipeline can inject. The first four are also AI-1's classes; the
+# last two are injectable and recoverable but invisible to AI-1, which reads
+# orbital elements only — run_pipeline() forces skip_classifier for those.
+# See pipeline.CLASSIFIER_BLIND_FAULTS.
+PIPELINE_FAULT_TYPES = [
+    "SEU", "software_bug", "firmware_corruption", "command_injection",
+    "battery_failure", "adcs_failure",
+]
+
+#: AI-1's actual output classes — a strict subset of the above.
+CLASSIFIER_FAULT_TYPES = ["SEU", "software_bug", "firmware_corruption", "command_injection"]
 
 
 class PipelineRunRequest(BaseModel):
@@ -867,6 +1110,113 @@ async def rf_spectrum():
             return {"online": True, "source": url, "data": resp.json()}
     except Exception as e:
         return {"online": False, "source": url, "error": str(e)}
+
+
+@app.get("/rf/intelligence")
+async def rf_intelligence():
+    """
+    Get RF intelligence analysis.
+    
+    Returns processed RF features, anomaly detection, and alerts
+    from the RF intelligence pipeline.
+    """
+    from rf.intelligence import get_rf_intelligence
+    
+    intelligence = get_rf_intelligence()
+    summary = intelligence.get_summary()
+    
+    return summary
+
+
+@app.post("/rf/ingest")
+async def rf_ingest(request: RFIngestRequest, _auth: None = Depends(require_api_key)):
+    """
+    RF data ingestion endpoint from Pi #2.
+    
+    This is the canonical endpoint where Pi #2 sends RF frames.
+    It validates the frame, stores the latest RF state, and makes it
+    available to the RF intelligence pipeline and WebSocket clients.
+    
+    Security: Requires API key authentication when DEADSAT_API_KEY is set.
+    """
+    global _latest_rf_frame
+    
+    frame = request.frame
+    
+    # Validate frame structure
+    try:
+        # Check timestamp freshness
+        frame_time = datetime.fromisoformat(frame.timestamp.replace('Z', '+00:00'))
+        age = (datetime.now(timezone.utc) - frame_time).total_seconds()
+        if age > 10.0:
+            return RFIngestResponse(
+                accepted=False,
+                sequence=frame.sequence,
+                message=f"Stale frame: {age:.1f}s old",
+                warnings=["Frame timestamp too old"]
+            )
+        
+        # Check frequency range
+        if not (1e6 <= frame.frequency_hz <= 30e9):
+            return RFIngestResponse(
+                accepted=False,
+                sequence=frame.sequence,
+                message=f"Invalid frequency: {frame.frequency_hz} Hz",
+                warnings=["Frequency out of valid range"]
+            )
+        
+        # Check signal strength range
+        if not (-150 <= frame.signal_dbm <= -10):
+            return RFIngestResponse(
+                accepted=False,
+                sequence=frame.sequence,
+                message=f"Invalid signal strength: {frame.signal_dbm} dBm",
+                warnings=["Signal strength out of valid range"]
+            )
+        
+        # Check sequence monotonicity
+        if _latest_rf_frame and frame.sequence <= _latest_rf_frame.sequence:
+            return RFIngestResponse(
+                accepted=False,
+                sequence=frame.sequence,
+                message=f"Non-increasing sequence: {frame.sequence} <= {_latest_rf_frame.sequence}",
+                warnings=["Sequence number not monotonically increasing"]
+            )
+        
+    except ValueError as e:
+        return RFIngestResponse(
+            accepted=False,
+            sequence=frame.sequence if hasattr(frame, 'sequence') else 0,
+            message=f"Invalid frame format: {e}",
+            warnings=["Frame validation failed"]
+        )
+    
+    # Store latest RF frame (thread-safe)
+    with _rf_frame_lock:
+        _latest_rf_frame = frame
+    
+    # Process RF frame for intelligence
+    try:
+        rf_intelligence = process_rf_frame_for_intelligence(frame)
+        print(f"[RF INTELLIGENCE] Frame {frame.sequence} processed: "
+              f"signal_trend={rf_intelligence.get('signal_trend')}, "
+              f"alerts={rf_intelligence.get('active_alerts')}")
+    except Exception as e:
+        print(f"[RF INTELLIGENCE] Processing error: {e}")
+    
+    # Broadcast to RF WebSocket clients
+    await ws_manager.broadcast_rf(frame)
+    
+    # Log successful ingestion
+    print(f"[RF INGEST] Frame {frame.sequence} accepted: signal={frame.signal_dbm:.1f} dBm "
+          f"SNR={frame.snr_db:.1f} dB freq={frame.frequency_hz/1e6:.3f} MHz")
+    
+    return RFIngestResponse(
+        accepted=True,
+        sequence=frame.sequence,
+        message="RF frame accepted and processed",
+        warnings=[]
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -996,7 +1346,12 @@ async def pipeline_status():
         "artifacts_dir":     str(bridge.artifacts_dir),
         "artifacts_ready":   available,
         "missing_artifacts": bridge.missing_artifacts(),
+        # What the pipeline accepts vs what AI-1 can actually name. Reported
+        # separately so a client cannot assume the classifier covers all six.
         "fault_types":       PIPELINE_FAULT_TYPES,
+        "classifier_fault_types": CLASSIFIER_FAULT_TYPES,
+        "classifier_blind_faults": [f for f in PIPELINE_FAULT_TYPES
+                                    if f not in CLASSIFIER_FAULT_TYPES],
         "seq_len":           CONFIG["seq_len"],
         "feature_cols":      FEATURE_COLS,
         # The dataset step is part of the instruction: training on the raw

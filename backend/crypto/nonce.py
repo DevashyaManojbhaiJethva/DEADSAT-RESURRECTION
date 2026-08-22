@@ -21,8 +21,12 @@ logging.basicConfig(
 logger = logging.getLogger('nonce')
 
 NONCE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nonce_store.db')
-REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
+# Hardcoded 'localhost' only worked because every deployment this project
+# documented ran redis on the same box as the API process. Docker Compose
+# (and any other setup where redis is a separate host) needs these
+# overridable — same DEADSAT_* env convention as config.py.
+REDIS_HOST = os.getenv('DEADSAT_REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('DEADSAT_REDIS_PORT', '6379'))
 NONCE_TTL_HOURS = 24
 
 

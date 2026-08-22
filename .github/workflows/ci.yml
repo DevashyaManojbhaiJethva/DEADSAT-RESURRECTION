@@ -1,0 +1,128 @@
+name: CI
+
+# Runs on every push and pull request. The point is to catch, automatically,
+# the classes of failure this repository has already shipped at least once:
+#
+#   * backend/ being accidentally used instead of the canonical main.py
+#     (backend/ is now deprecated; this test verifies it stays retired)
+#   * a frontend that does not type-check, or a node_modules that was never
+#     installed cleanly — `npm ci` fails on a half-finished install, `npm
+#     install` papers over it
+#   * a package-lock.json that no longer matches package.json
+#   * Python that does not even compile
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Fast checks. No heavy dependencies, so a broken tree fails in seconds
+  # rather than after a torch download.
+  # ---------------------------------------------------------------------
+  static:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: py_compile every Python file
+        run: |
+          python -m compileall -q . \
+            -x '(\.git|node_modules|__pycache__|\.venv)'
+          echo "all Python files compile"
+
+      - name: backend/ deprecation check
+        run: python test_backend_sync.py
+
+      - name: package-lock.json matches package.json
+        # Runs BEFORE npm ci in the frontend job too, but repeated here so a
+        # lockfile mismatch is reported by the fast job rather than only after
+        # a Node setup.
+        run: python check_lockfile_sync.py
+
+      - name: Threat model citations resolve
+        # docs/THREAT_MODEL.md names a file and function for every mitigation.
+        # Renaming a function without updating the document turns a security
+        # claim into a lie, silently. This catches that on the same push.
+        run: python docs/verify_threat_model.py
+
+  # ---------------------------------------------------------------------
+  # Python test suites
+  # ---------------------------------------------------------------------
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # liboqs-python is NOT on PyPI (it needs liboqs built from source),
+          # so the crypto layer runs on its development shim here. The suite
+          # asserts the shim FAILS CLOSED rather than pretending to sign —
+          # see test_sign_refuses_to_fabricate_when_crypto_is_mocked.
+          pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python test_units.py
+
+      - name: Integration tests
+        run: python test_integration.py
+
+      - name: Mutation check — can the tests actually fail?
+        # A suite that passes proves nothing until you have watched it fail
+        # for the right reason. This reverts each fix and asserts its guarding
+        # test goes red. It found two tests that could not fail.
+        run: python verify_tests_can_fail.py
+
+  # ---------------------------------------------------------------------
+  # Frontend
+  # ---------------------------------------------------------------------
+  frontend:
+    name: Frontend typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: package-lock.json matches package.json
+        # npm ci's own error on a mismatch names no packages. This does.
+        run: python check_lockfile_sync.py
+
+      - name: Install (npm ci, not npm install)
+        # `npm ci` installs strictly from the lockfile and fails on a partial
+        # or inconsistent state. `npm install` would silently repair the very
+        # condition this job exists to detect — frontend/node_modules was once
+        # 198 packages with no vite and no typescript, and nothing caught it.
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type-check
+        working-directory: frontend
+        run: npx tsc --noEmit

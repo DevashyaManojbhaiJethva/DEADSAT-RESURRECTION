@@ -6,6 +6,7 @@
 
 **Far Away 2026 · India's Largest International Hackathon · Japan Grand Finale**
 
+[![CI](https://github.com/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION/actions/workflows/ci.yml/badge.svg)](https://github.com/DevashyaManojbhaiJethva/DEADSAT-RESURRECTION/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev/)
@@ -497,6 +498,94 @@ python3 main.py
 ```
 
 The FastAPI server starts on `http://0.0.0.0:8000`, running the emulator, AI-1 classifier, AI-2 recovery agent, and the full crypto layer (self-test + watchdog start automatically).
+
+#### Run from the repository root
+
+**`python main.py` must be run with the repository root as the working
+directory.** Not a style preference — module identity depends on it.
+
+`main.py` adds four directories to `sys.path` and imports their contents as
+top-level modules rather than as packages:
+
+```python
+sys.path.append(str(Path(__file__).parent / "emulator"))   # satellite_emulator, contact_calculator
+sys.path.append(str(Path(__file__).parent / "agents"))     # recovery_agent
+sys.path.append(str(Path(__file__).parent / "crypto"))     # crypto_routes
+sys.path.append(str(Path(__file__).parent / "models"))     # classifier_inference, feature_spec
+```
+
+This works, but it makes resolution order-dependent. The sharp edge:
+
+```python
+from pipeline import run_pipeline          # main.py
+```
+
+From the repo root that resolves to the root **module** `pipeline.py`.
+
+**Note:** The `backend/` directory tree is now deprecated. The canonical
+backend is the root `main.py`. The `backend/` tree is preserved for reference
+only and should not be used in production. See `backend/DEPRECATED.md` for details.
+
+Consequences worth knowing:
+
+- Start the API as `python main.py` (or `uvicorn main:app`) **from the repo
+  root**. Running it from inside `emulator/` or `backend/` silently changes
+  which modules load.
+- Do not use `backend/main.py` — it is deprecated. The root `main.py` is the
+  authoritative backend.
+- Every test (`test_units.py`, `test_integration.py`, `test_backend_sync.py`)
+  assumes the repo root and resolves paths from `__file__`, so they are safe
+  either way.
+
+#### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, in three jobs:
+
+| Job | Checks |
+|---|---|
+| **Static** | `py_compile` on every `.py`; `test_backend_sync.py`; `check_lockfile_sync.py`; `docs/verify_threat_model.py` |
+| **Python** | `test_units.py`; `test_integration.py`; `verify_tests_can_fail.py` |
+| **Frontend** | `check_lockfile_sync.py`; `npm ci`; `npx tsc --noEmit` |
+
+Run the same checks locally before pushing:
+
+```bash
+python -m compileall -q . -x '(\.git|node_modules|__pycache__)'
+python test_backend_sync.py        # backend/ drift guard
+python check_lockfile_sync.py      # package-lock vs package.json
+python test_units.py
+python test_integration.py
+python verify_tests_can_fail.py    # do the tests actually fail when reverted?
+cd frontend && npm ci && npx tsc --noEmit
+```
+
+Three deliberate choices:
+
+- **`npm ci`, never `npm install`.** `npm ci` installs strictly from the
+  lockfile and fails on a partial or inconsistent `node_modules`. `npm install`
+  would silently repair exactly the condition CI exists to detect — this repo
+  once carried a `frontend/node_modules` of 198 packages with no `vite` and no
+  `typescript`, and nothing caught it.
+- **`test_backend_sync.py` runs first.** `backend/` is a duplicated tree that
+  is properly deprecated and not accidentally used. The `backend/` tree was
+  once a duplicate backend that drifted from the root; it is now retired and
+  this test ensures it stays retired.
+- **`verify_tests_can_fail.py` is a CI step, not a one-off.** It reverts each
+  fix and asserts the guarding test goes red. It found two tests that could not
+  fail; without it they would still be counted as passing coverage.
+
+> **The badge is red until `frontend/package-lock.json` is regenerated.**
+> Prompts 0.1 and 5.1 edited `package.json` (added `@types/react` and
+> `@types/react-dom`, removed `@google/genai`, `express`, `dotenv`) in an
+> environment with no registry access, so the lockfile could not be rebuilt.
+> `npm ci` refuses to run on the mismatch. One command fixes it:
+>
+> ```bash
+> cd frontend && npm install && git add package-lock.json
+> ```
+>
+> `python check_lockfile_sync.py` names the offending packages; `npm ci`'s own
+> error does not.
 
 #### Train AI-1 (required once, on a fresh clone)
 

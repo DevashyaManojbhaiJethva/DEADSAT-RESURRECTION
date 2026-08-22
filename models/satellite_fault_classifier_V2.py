@@ -69,7 +69,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.model_selection import train_test_split, GroupShuffleSplit, StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import classification_report, confusion_matrix
@@ -431,6 +431,29 @@ def assign_fault_labels(df: pd.DataFrame) -> pd.DataFrame:
 # 4. SYNTHETIC DATA AUGMENTATION
 # ---------------------------------------------------------------------------
 
+def _class_rng(class_index: int) -> "np.random.Generator":
+    """
+    An independent, reproducible Generator per fault class.
+
+    `default_rng(seed)` called with the SAME seed in four places yields four
+    identical streams — which is what _generate_synthetic_class() did, so all
+    four classes received the same noise sequence. Noise correlated across
+    classes is worse than no noise: it puts an identical perturbation pattern
+    on every class, which a model can learn as signal.
+
+    `SeedSequence(seed).spawn(...)` is numpy's supported way to derive
+    statistically independent child streams from one root seed. The result is
+    deterministic — same CONFIG["random_seed"], same streams, every run — and
+    independent of the global RNG, of import order, and of anything else in
+    the process.
+    """
+    root = np.random.SeedSequence(CONFIG["random_seed"])
+    # spawn enough children for every class, then take this one, so the set of
+    # streams does not change as classes are added.
+    children = root.spawn(max(len(FAULT_LABELS), class_index + 1))
+    return np.random.default_rng(children[class_index])
+
+
 def augment_fault_samples(df: pd.DataFrame, target_per_class: int = 300) -> pd.DataFrame:
     """
     Gaussian-noise augmentation around real fault samples to balance classes.
@@ -455,7 +478,7 @@ def augment_fault_samples(df: pd.DataFrame, target_per_class: int = 300) -> pd.D
     fault_df = df[df["fault_label"] != "NORMAL"].copy()
     augmented_rows = []
 
-    for label in FAULT_LABELS:
+    for class_index, label in enumerate(FAULT_LABELS):
         class_df = fault_df[fault_df["fault_label"] == label]
         n_needed = max(0, target_per_class - len(class_df))
         if n_needed == 0:
@@ -470,12 +493,27 @@ def augment_fault_samples(df: pd.DataFrame, target_per_class: int = 300) -> pd.D
             print(f"  [WARN] no real {label} rows in this split — falling back "
                   f"to the DEPRECATED synthetic generator. Regenerate the "
                   f"dataset with generate_dataset.py instead.")
-            class_df = _generate_synthetic_class(label, n=target_per_class)
+            class_df = _generate_synthetic_class(label, n=target_per_class,
+                                                 class_index=class_index)
+
+        # REPRODUCIBILITY: this used the GLOBAL numpy RNG —
+        # `np.random.normal(...)` — while every line around it threaded
+        # random_state=CONFIG["random_seed"]. Any earlier consumer of the
+        # global stream (a library import, a shuffle, an unrelated call)
+        # shifted the noise, so two runs of the same command produced
+        # different augmented rows and therefore different weights. Nothing
+        # else in the file was affected, which made it invisible: the split
+        # was reproducible, the model was not.
+        #
+        # Each class draws from its OWN generator, seeded by
+        # (random_seed, class_index), so the classes are independent of each
+        # other and of everything else in the process.
+        rng = _class_rng(class_index)
 
         samples = class_df.sample(n=n_needed, replace=True, random_state=CONFIG["random_seed"])
         for col in FEATURE_COLS:
             std = max(class_df[col].std() * 0.05, 1e-9)
-            samples[col] = samples[col] + np.random.normal(0, std, n_needed)
+            samples[col] = samples[col] + rng.normal(0, std, n_needed)
         augmented_rows.append(samples)
 
     if augmented_rows:
@@ -488,7 +526,8 @@ def augment_fault_samples(df: pd.DataFrame, target_per_class: int = 300) -> pd.D
     return aug_df
 
 
-def _generate_synthetic_class(label: str, n: int) -> pd.DataFrame:
+def _generate_synthetic_class(label: str, n: int,
+                              class_index: int | None = None) -> pd.DataFrame:
     """
     DEPRECATED — kept for backward compatibility, do not use in new code.
 
@@ -504,14 +543,21 @@ def _generate_synthetic_class(label: str, n: int) -> pd.DataFrame:
     rows learns "high absolute eccentricity means SEU", which is not what the
     labeller, the emulator or the fault taxonomy mean by SEU.
 
-    Two further defects, both Phase 8.1 reproducibility issues:
-      * `default_rng(seed)` is re-created on every call, so all four classes
-        draw the SAME noise sequence — correlated noise across classes.
+    One further defect remains by design:
       * every generated row gets NORAD_CAT_ID = 0, so after the Phase 2 fix
         they all collapse into a single satellite group and land wholly in
-        one split.
+        one split. Another reason not to use this path.
+
+    FIXED in Phase 8.1: `default_rng(CONFIG["random_seed"])` was re-created on
+    every call, so all four classes drew the IDENTICAL noise sequence —
+    correlated noise across classes, which a model can learn as signal.
+    `class_index` now selects an independent child stream via _class_rng().
+    It defaults to deriving the index from `label`, so the old two-argument
+    call signature still works and still gets independent noise.
     """
-    rng = np.random.default_rng(CONFIG["random_seed"])
+    if class_index is None:
+        class_index = list(FAULT_LABELS).index(label) if label in FAULT_LABELS else 0
+    rng = _class_rng(class_index)
     base = {
         "SEU": dict(MEAN_MOTION=14.5, ECCENTRICITY=0.05, INCLINATION=51.6,
                      RA_OF_ASC_NODE=180, ARG_OF_PERICENTER=180, MEAN_ANOMALY=180,
@@ -533,6 +579,19 @@ def _generate_synthetic_class(label: str, n: int) -> pd.DataFrame:
 
     records = {}
     for col, mean in base.items():
+        # SEU's ECCENTRICITY is documented above as "a flat 0.05 series" that
+        # contradicts the labeller's jump-based SEU definition (ecc_delta ==
+        # 0, never > eccentricity_jump_threshold). Gaussian noise here
+        # (~15% chance per adjacent pair of crossing the 0.01 threshold,
+        # since the noise stddev alone is 0.1 * 0.05 = 0.005) made that claim
+        # only incidentally true depending on RNG state — a fixed seed could
+        # deterministically produce rows that DO cross the threshold, which
+        # is exactly what test_synthetic_seu_contradicts_the_labeller caught.
+        # Keeping this one column truly constant makes the documented
+        # contradiction actually hold, deterministically.
+        if label == "SEU" and col == "ECCENTRICITY":
+            records[col] = np.full(n, mean)
+            continue
         scale = abs(mean) * 0.1 if mean != 0 else 0.001
         records[col] = rng.normal(mean, scale, n)
 
@@ -744,23 +803,55 @@ def split_by_satellite(df: pd.DataFrame, seed: int | None = None):
     construction, that is a direct answer leak: the model can memorise a
     satellite in training and recognise it in test.
 
-    Uses GroupShuffleSplit(groups=NORAD_CAT_ID) so a satellite lands wholly in
-    exactly one of train / val / test. Returns rows sorted by
-    (NORAD_CAT_ID, EPOCH) so the windowing step downstream is contiguous.
+    STRATIFIED — every fault class must land in every split.
+    ------------------------------------------------------------------------
+    Plain GroupShuffleSplit balances satellite COUNT across splits but knows
+    nothing about fault_label. The rarest classes (SEU: 492 rows, roughly 3.6%
+    of the dataset) live on a small number of satellites, so an unstratified
+    shuffle can — and did — place every SEU-bearing and every
+    SOFTWARE_BUG-bearing satellite in train, leaving val/test with 0 rows of
+    those classes. Training then reports near-perfect accuracy (measured only
+    on the classes that happened to survive the split) while the model never
+    demonstrably learned to separate SEU/SOFTWARE_BUG from FIRMWARE_CORRUPTION
+    or COMMAND_INJECTION — confirmed by test_integration.py, which drives the
+    real emulator and gets those two classes wrong.
+
+    Fixed with StratifiedGroupKFold: each satellite is assigned the rarest
+    fault type it contains (SEU > SOFTWARE_BUG > FIRMWARE_CORRUPTION >
+    COMMAND_INJECTION > NORMAL, in that priority order), and the fold split is
+    stratified on that label while still keeping every satellite's rows
+    wholly inside one split.
     """
     seed = CONFIG["random_seed"] if seed is None else seed
     sort_cols = ["NORAD_CAT_ID"] + (["EPOCH"] if "EPOCH" in df.columns else [])
     df = df.sort_values(sort_cols).reset_index(drop=True)
     groups = df["NORAD_CAT_ID"].values
 
-    gss = GroupShuffleSplit(n_splits=1, test_size=CONFIG["test_size"],
-                            random_state=seed)
-    tv_idx, test_idx = next(gss.split(df, groups=groups))
+    # Rarest-first priority so a satellite that has even one SEU row is
+    # stratified as "SEU", not out-voted by its far more common NORMAL rows.
+    priority = ["SEU", "SOFTWARE_BUG", "FIRMWARE_CORRUPTION", "COMMAND_INJECTION"]
+
+    def _dominant_label(labels):
+        present = set(labels)
+        for p in priority:
+            if p in present:
+                return p
+        return "NORMAL"
+
+    sat_strat_label = df.groupby("NORAD_CAT_ID")["fault_label"].agg(_dominant_label)
+    strat_label = df["NORAD_CAT_ID"].map(sat_strat_label).values
+
+    n_splits_test = max(2, round(1 / CONFIG["test_size"]))
+    sgkf = StratifiedGroupKFold(n_splits=n_splits_test, shuffle=True, random_state=seed)
+    tv_idx, test_idx = next(sgkf.split(df, y=strat_label, groups=groups))
     df_tv, df_test = df.iloc[tv_idx], df.iloc[test_idx]
 
     val_frac = CONFIG["val_size"] / (1 - CONFIG["test_size"])
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=val_frac, random_state=seed)
-    tr_idx, val_idx = next(gss2.split(df_tv, groups=df_tv["NORAD_CAT_ID"].values))
+    n_splits_val = max(2, round(1 / val_frac))
+    sgkf2 = StratifiedGroupKFold(n_splits=n_splits_val, shuffle=True, random_state=seed)
+    strat_label_tv = strat_label[tv_idx]
+    groups_tv = groups[tv_idx]
+    tr_idx, val_idx = next(sgkf2.split(df_tv, y=strat_label_tv, groups=groups_tv))
 
     train_df = df_tv.iloc[tr_idx].sort_values(sort_cols).reset_index(drop=True)
     val_df   = df_tv.iloc[val_idx].sort_values(sort_cols).reset_index(drop=True)
@@ -781,14 +872,162 @@ def split_by_satellite(df: pd.DataFrame, seed: int | None = None):
     print(f"\n[SPLIT] by satellite -> train {len(tr_s)} sats / {len(train_df)} rows"
           f" | val {len(va_s)} / {len(val_df)}"
           f" | test {len(te_s)} / {len(test_df)}")
+
+    # Visibility for the failure mode this function was rewritten to prevent:
+    # a class with 0 rows in val or test used to pass silently (support=0
+    # slipped through classification_report) and only surfaced as wrong
+    # predictions against the live emulator. Fail loudly here instead.
+    fault_classes = [c for c in FAULT_LABELS if c != "NORMAL"] if "FAULT_LABELS" in globals() else priority
+    for name, split_df in (("train", train_df), ("val", val_df), ("test", test_df)):
+        counts = split_df[split_df["fault_label"] != "NORMAL"]["fault_label"].value_counts()
+        missing = [c for c in fault_classes if counts.get(c, 0) == 0]
+        print(f"  [SPLIT] {name} fault counts: {counts.to_dict()}")
+        if missing:
+            print(f"  [WARN] {name} split has ZERO rows for {missing} — "
+                  f"metrics on this split cannot say anything about "
+                  f"{'that class' if len(missing) == 1 else 'those classes'}.")
+
     return train_df, val_df, test_df
 
 
-def _to_windows(df: pd.DataFrame, scaler: StandardScaler, seq: int):
-    """Scale, then window strictly within each satellite."""
+class _WindowArrayDataset(Dataset):
+    """
+    Thin Dataset wrapper around pre-built (N, seq_len, n_features) window
+    arrays. Used for the balanced training set, where windows are built once
+    by _fault_ending_windows() and then class-balanced by _augment_windows()
+    duplicating whole windows — unlike OrbitalSequenceDataset, it does not
+    re-derive windows from row groups, because there is nothing left to
+    derive: the arrays it wraps already are the final windows.
+    """
+    def __init__(self, samples: np.ndarray, labels: np.ndarray):
+        self.samples = samples.astype(np.float32)
+        self.labels = labels.astype(np.int64)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.samples[idx]), torch.tensor(self.labels[idx])
+
+
+def _fault_ending_windows(df: pd.DataFrame, scaler: StandardScaler, seq: int):
+    """
+    Window each satellite's FULL epoch sequence — NORMAL rows included — and
+    keep only the windows whose FINAL row is a real fault.
+
+    THE BUG THIS REPLACES
+    ----------------------------------------------------------------------
+    build_dataloaders() used to drop every NORMAL row from train/val/test
+    BEFORE windowing (`val_df[val_df["fault_label"] != "NORMAL"]`, and
+    augment_fault_samples() did the same for train). Windows were then built
+    from whatever fault-only rows happened to survive, stitched together in
+    epoch order regardless of whether they were ever actually adjacent once
+    NORMAL rows were removed. That produced training/val/test windows that
+    look nothing like what the live system sends the model at inference
+    time: /pipeline/classify hands AI-1 the most recent `seq_len` telemetry
+    frames from the ring buffer, almost always mostly-NORMAL context ending
+    on whatever fault is happening right now (see test_integration.py TEST
+    9, "Window built from ... fault signature: SEU"). Transient one-epoch
+    faults like SEU essentially never occur as 8 fault-only rows in a row,
+    so they were silently windowed out of val/test entirely — the earlier
+    version of this pipeline reported ~100% val/test accuracy while its
+    classification_report support column read 0 for exactly those classes,
+    and the model then got 3 of 4 fault types wrong against the live
+    emulator in test_integration.py.
+
+    Building windows over the real, unmodified per-satellite sequence and
+    only requiring the LAST row to be a fault (any of the seq_len-1 rows
+    before it may be NORMAL, exactly as in production) fixes both problems
+    at once: windows are drawn from real adjacent epochs, and rare classes
+    get windows whenever they occur at position >= seq_len within a
+    satellite's series, instead of only when >= seq_len fault rows happen to
+    survive a NORMAL-stripping filter.
+    """
     X = scaler.transform(df[FEATURE_COLS].values.astype(np.float32))
-    y = df["fault_label"].map(FAULT_LABELS).values.astype(np.int64)
-    return OrbitalSequenceDataset(X, y, seq, groups=df["NORAD_CAT_ID"].values)
+    # NORMAL has no entry in FAULT_LABELS; sentinel -1 keeps every row in the
+    # sequence (so windows still span real NORMAL context) while marking
+    # which windows must be dropped afterward — those NOT ending on a fault.
+    y_sentinel = df["fault_label"].map(FAULT_LABELS).fillna(-1).values.astype(np.int64)
+    ds = OrbitalSequenceDataset(X, y_sentinel, seq, groups=df["NORAD_CAT_ID"].values)
+    keep = ds.labels != -1
+    return ds.samples[keep], ds.labels[keep]
+
+
+def _augment_windows(samples: np.ndarray, labels: np.ndarray, target_per_class: int):
+    """
+    Window-level BALANCING for the training set (not just oversampling),
+    replacing the old row-level augment_fault_samples() for the
+    transformer's own training data.
+
+    Every class is brought to exactly target_per_class:
+      * below target -> oversampled by duplicating real windows with small
+        per-feature Gaussian noise (0.05 * that class's per-feature std)
+      * above target -> subsampled without replacement
+
+    Oversampling minority classes up to target_per_class while leaving
+    majority classes at their much larger natural counts (observed:
+    SEU/SOFTWARE_BUG capped at 400 while FIRMWARE_CORRUPTION/
+    COMMAND_INJECTION kept their natural 742/1209) still leaves training
+    class-imbalanced 400:400:742:1209. That measurably biased the model:
+    it reached ~99% test accuracy (majority classes dominate the test set
+    too) while confidently (~99% softmax confidence) mispredicting a live
+    SEU injection as COMMAND_INJECTION in test_integration.py, despite the
+    window showing a textbook eccentricity jump and none of
+    COMMAND_INJECTION's own defining conditions (TLE_AGE_HOURS nowhere near
+    the stale threshold). Capping majority classes down to target_per_class
+    too removes that skew.
+
+    This must operate on already-built windows, not raw rows: duplicating
+    individual ROWS (the old approach) only produces a valid training
+    example if windowing later manages to re-stitch `seq_len` of them back
+    into a contiguous same-satellite run, which for rare classes it mostly
+    did not (see _fault_ending_windows' docstring). Duplicating whole
+    windows sidesteps that entirely — every synthetic example is guaranteed
+    to be a coherent seq_len-long sequence because it was one before noise
+    was added.
+    """
+    out_samples, out_labels = [], []
+    for class_index in range(CONFIG["num_classes"]):
+        label_name = IDX_TO_LABEL[class_index]
+        mask = labels == class_index
+        n_real = int(mask.sum())
+        class_samples = samples[mask]
+        rng = _class_rng(class_index)
+
+        if n_real == 0:
+            print(f"  [WARN] no real {label_name} windows in the training split — "
+                  f"cannot synthesize from nothing; this class will be absent "
+                  f"from training.")
+            continue
+
+        if n_real == target_per_class:
+            print(f"  {label_name}: {n_real} real windows == target, unchanged")
+            out_samples.append(class_samples)
+            out_labels.append(labels[mask])
+            continue
+
+        if n_real < target_per_class:
+            n_needed = target_per_class - n_real
+            print(f"  Augmenting {label_name}: {n_real} real windows -> +{n_needed} synthetic")
+            idx = rng.integers(0, n_real, size=n_needed)
+            picked = class_samples[idx].copy()
+            std = np.maximum(class_samples.std(axis=(0, 1), keepdims=True) * 0.05, 1e-9)
+            picked = picked + rng.normal(0, 1, picked.shape) * std
+            out_samples.append(np.concatenate([class_samples, picked.astype(np.float32)]))
+            out_labels.append(np.full(n_real + n_needed, class_index, dtype=np.int64))
+        else:
+            print(f"  Subsampling {label_name}: {n_real} real windows -> {target_per_class} "
+                  f"(capped to match the smaller classes)")
+            idx = rng.choice(n_real, size=target_per_class, replace=False)
+            out_samples.append(class_samples[idx])
+            out_labels.append(np.full(target_per_class, class_index, dtype=np.int64))
+
+    all_samples = np.concatenate(out_samples, axis=0)
+    all_labels = np.concatenate(out_labels, axis=0)
+    print("\n[AUG] Post-augmentation window counts:")
+    for i in range(CONFIG["num_classes"]):
+        print(f"  {IDX_TO_LABEL[i]}: {int((all_labels == i).sum())}")
+    return all_samples, all_labels
 
 
 def build_dataloaders(df_labelled: pd.DataFrame, scaler: StandardScaler = None,
@@ -796,15 +1035,29 @@ def build_dataloaders(df_labelled: pd.DataFrame, scaler: StandardScaler = None,
     """
     Leak-free preparation. Order matters and is the whole point:
 
-        1. split by satellite          (LEAK 1)
-        2. augment the TRAIN split only (LEAK 2)
-        3. fit the scaler on TRAIN only (LEAK 3)
-        4. window within each satellite (LEAK 1)
+        1. split by satellite, NORMAL rows kept        (LEAK 1)
+        2. fit the scaler on TRAIN only                (LEAK 3)
+        3. window each split over its real per-satellite
+           sequence, keep only fault-ending windows     (see
+           _fault_ending_windows)
+        4. balance the TRAIN windows only, by duplicating
+           whole windows with noise                     (LEAK 2; see
+           _augment_windows)
 
     Was: `build_dataloaders(aug_df, scaler)` — received data that had already
     been augmented and scaled against the full dataset, then split it at
     random. Every one of the three leaks happened before this function was
     even called.
+
+    A later bug (still leak-free, but wrong): NORMAL rows were dropped from
+    every split before windowing, so windows were built from fault-only rows
+    stitched together regardless of real epoch adjacency — nothing like the
+    mostly-NORMAL-context windows the live system actually sends the model.
+    Rare classes lost all their val/test windows this way while training
+    still reported ~100% accuracy on the classes that survived, and the
+    model got 3 of 4 fault types wrong against the live emulator
+    (test_integration.py). Fixed by keeping NORMAL rows through windowing and
+    filtering afterward to windows that END on a fault.
 
     The `scaler` argument is ignored and kept only so an old call site fails
     loudly rather than silently reintroducing leak 3.
@@ -813,32 +1066,50 @@ def build_dataloaders(df_labelled: pd.DataFrame, scaler: StandardScaler = None,
         print("  [WARN] build_dataloaders() no longer accepts a pre-fitted "
               "scaler — it fits one on the training split (LEAK 3). Ignoring.")
 
-    # 1. split by satellite, on UNAUGMENTED data
+    # 1. split by satellite, on UNAUGMENTED data (NORMAL rows kept — the
+    #    window step needs real per-satellite context, see
+    #    _fault_ending_windows)
     train_df, val_df, test_df = split_by_satellite(df_labelled)
 
-    # 2. augment the training split only. Val/test keep their real
-    #    distribution, so the reported metrics describe real data.
-    train_df = augment_fault_samples(train_df, target_per_class=target_per_class)
-    val_df   = val_df[val_df["fault_label"] != "NORMAL"].reset_index(drop=True)
-    test_df  = test_df[test_df["fault_label"] != "NORMAL"].reset_index(drop=True)
-
-    # 3. fit the scaler on the training split ONLY, then transform the others
+    # 2. fit the scaler on the training split ONLY, then transform the others
     scaler = StandardScaler()
     scaler.fit(train_df[FEATURE_COLS].values.astype(np.float32))
     print(f"[SCALE] StandardScaler fitted on {len(train_df)} training rows only")
 
-    # 4. window within satellite
+    # 3. window each split over its real, unmodified per-satellite sequence,
+    #    keeping only windows that end on a real fault (NORMAL context rows
+    #    before the last one are kept, exactly as at inference time).
     seq = CONFIG["seq_len"]
-    train_ds = _to_windows(train_df, scaler, seq)
-    val_ds   = _to_windows(val_df, scaler, seq)
-    test_ds  = _to_windows(test_df, scaler, seq)
+    train_samples, train_labels = _fault_ending_windows(train_df, scaler, seq)
+    val_samples,   val_labels   = _fault_ending_windows(val_df, scaler, seq)
+    test_samples,  test_labels  = _fault_ending_windows(test_df, scaler, seq)
+
+    print(f"[WINDOW] natural fault-ending windows -> "
+          f"train {len(train_labels)}  val {len(val_labels)}  test {len(test_labels)}")
+    for name, lbl in (("train", train_labels), ("val", val_labels), ("test", test_labels)):
+        counts = {IDX_TO_LABEL[i]: int((lbl == i).sum()) for i in range(CONFIG["num_classes"])}
+        missing = [c for c, n in counts.items() if n == 0]
+        print(f"  [WINDOW] {name}: {counts}")
+        if missing:
+            print(f"  [WARN] {name} split has ZERO fault-ending windows for {missing} "
+                  f"— metrics on this split cannot say anything about "
+                  f"{'that class' if len(missing) == 1 else 'those classes'}.")
+
+    # 4. balance the TRAINING windows only (val/test keep their real,
+    #    unbalanced distribution so metrics describe real data).
+    train_samples, train_labels = _augment_windows(train_samples, train_labels,
+                                                    target_per_class=target_per_class)
+
+    train_ds = _WindowArrayDataset(train_samples, train_labels)
+    val_ds   = _WindowArrayDataset(val_samples, val_labels)
+    test_ds  = _WindowArrayDataset(test_samples, test_labels)
 
     print(f"[DATA] Windows -> train: {len(train_ds)}  val: {len(val_ds)}  "
           f"test: {len(test_ds)}")
     for name, ds in (("val", val_ds), ("test", test_ds)):
         if len(ds) == 0:
             print(f"  [WARN] {name} split produced 0 windows — every satellite "
-                  f"in it has fewer than seq_len={seq} fault rows")
+                  f"in it has fewer than seq_len={seq} rows before its first fault")
 
     bs = CONFIG["batch_size"]
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=0)
@@ -927,7 +1198,7 @@ def evaluate_model(model, test_loader, device):
 
     target_names = [IDX_TO_LABEL[i] for i in range(CONFIG["num_classes"])]
     print("\n[EVAL] Classification Report:")
-    print(classification_report(all_labels, all_preds, target_names=target_names, zero_division=0))
+    print(classification_report(all_labels, all_preds, labels=list(range(CONFIG["num_classes"])), target_names=target_names, zero_division=0))
     print("[EVAL] Confusion Matrix:")
     print(confusion_matrix(all_labels, all_preds))
 
@@ -998,7 +1269,7 @@ def run_baselines(train_loader, test_loader) -> list[dict]:
     print(f"  train windows {X_tr.shape}   test windows {X_te.shape}")
     results = []
 
-    lr = LogisticRegression(max_iter=2000, multi_class="auto",
+    lr = LogisticRegression(max_iter=2000,
                             random_state=CONFIG["random_seed"])
     lr.fit(X_tr, y_tr)
     results.append(_metrics_dict(y_te, lr.predict(X_te), "Logistic regression"))
@@ -1319,8 +1590,9 @@ def main():
         df_labelled, target_per_class=400)
 
     # --- Step 5: Isolation Forest (NORMAL rows of the TRAIN split only) -----
-    # train_df has had its NORMAL rows dropped by augment_fault_samples(), so
-    # re-select from the labelled frame using the training satellites.
+    # train_df already has its NORMAL rows (build_dataloaders no longer drops
+    # them — see _fault_ending_windows); re-selecting from df_labelled by
+    # satellite ID is still the simplest way to get an identical frame.
     train_sats = set(train_df["NORAD_CAT_ID"])
     iforest = train_isolation_forest(
         df_labelled[df_labelled["NORAD_CAT_ID"].isin(train_sats)], scaler)

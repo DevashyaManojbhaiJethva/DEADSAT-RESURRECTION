@@ -538,7 +538,13 @@ def node_schedule_uplink(state: AgentState) -> AgentState:
             print("[Agent]    Ground contact: ACTIVE — uplink allowed immediately")
         else:
             # Bug Fix 4: step_seconds=10 for accurate AOS timing
-            window = calc.find_next_contact(search_hours=24.0, step_seconds=10.0)
+            # step_seconds=60 (the default), not 10. This ran inside the
+            # recovery graph, synchronously: a 10 s step over 24 h is 8,640
+            # SGP4 propagations while a fault is active. find_next_contact()
+            # now brackets at the coarse step and BISECTS the crossing, so 60 s
+            # gives ~1 s AOS precision for ~76 propagations — more accurate
+            # than the old 10 s scan and about 113x cheaper.
+            window = calc.find_next_contact(search_hours=24.0, step_seconds=60.0)
             state["contact_window"] = window or {}
             # WIRING: was unconditionally True. Now driven by config so a real
             # deployment can enforce contact windows, while bench/demo runs

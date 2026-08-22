@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Shield, Radio, Activity, Cpu, Warning, Check } from './Icons';
 // WIRING: real backend calls. These buttons previously only mutated local
 // state and dispatched a CustomEvent for cosmetic chart spikes.
@@ -137,29 +137,51 @@ export default function OperatorControlPanel() {
   // These figures previously random-walked between fixed bounds, which made
   // the model look like it was performing regardless of whether it was
   // even trained.
+  // WIRING: /pipeline/status ONCE on mount — no timer.
+  //
+  // This used to run every 15 s. With AI-1 untrained that is a 503 four times
+  // a minute for as long as the tab is open; with artifacts present it is a
+  // full transformer inference pass every 15 s on a Raspberry Pi 4, to refresh
+  // one number in a corner that nothing was waiting on.
+  //
+  // Classification now happens only when there is a reason: on demand after a
+  // fault is injected (classifyNow, below), and from the classifier_confidence
+  // AI-1 already publishes on /ws/events with pipeline_complete — which costs
+  // nothing, because the pipeline has just run the model anyway.
+  const [artifactsReady, setArtifactsReady] = useState<boolean | null>(null);
+
   useEffect(() => {
     let alive = true;
-    const load = async () => {
+    (async () => {
       try {
         const status: any = await api.pipelineStatus();
         if (!alive) return;
+        setArtifactsReady(Boolean(status.artifacts_ready));
         if (!status.artifacts_ready) {
           setConfusionVals(prev => ({ ...prev, truePos: 0, accuracy: 0 }));
           setTraceLogs(prev => [`[ai-1] artifacts not trained — ${status.hint ?? ''}`, ...prev].slice(0, 8));
-          return;
         }
-        const r: any = await api.classify();
+      } catch (e: any) {
         if (!alive) return;
-        const pct = Number(((r.confidence ?? 0) * 100).toFixed(1));
-        setConfusionVals(prev => ({ ...prev, truePos: pct, accuracy: pct }));
-      } catch {
-        if (alive) setConfusionVals(prev => ({ ...prev, truePos: 0, accuracy: 0 }));
+        setArtifactsReady(false);
+        setConfusionVals(prev => ({ ...prev, truePos: 0, accuracy: 0 }));
+        setTraceLogs(prev => [`[ai-1] status unavailable — ${e.message}`, ...prev].slice(0, 8));
       }
-    };
-    load();
-    const t = setInterval(load, 15000);
-    return () => { alive = false; clearInterval(t); };
+    })();
+    return () => { alive = false; };
   }, []);
+
+  /** Run AI-1 once, on demand. No-op when the artifacts are not trained. */
+  const classifyNow = useCallback(async () => {
+    if (artifactsReady !== true) return;
+    try {
+      const r: any = await api.classify();
+      const pct = Number(((r.confidence ?? 0) * 100).toFixed(1));
+      setConfusionVals(prev => ({ ...prev, truePos: pct, accuracy: pct }));
+    } catch {
+      setConfusionVals(prev => ({ ...prev, truePos: 0, accuracy: 0 }));
+    }
+  }, [artifactsReady]);
 
   const handleInjectFault = async () => {
     setInjecting(true);
@@ -177,6 +199,10 @@ export default function OperatorControlPanel() {
         `[backend] Fault '${backendFault}' injected into emulator — telemetry degrading.`,
         ...prev,
       ]);
+      // Fault transition: the one moment a fresh classification is worth the
+      // inference cost. Replaces the 15 s poll. Not awaited — the trace log
+      // below should not wait on a transformer pass.
+      void classifyNow();
     } catch (err: any) {
       setTraceLogs([
         `[backend] INJECTION FAILED — ${err.message}`,
@@ -336,6 +362,12 @@ export default function OperatorControlPanel() {
               ? `${(p.classifier_confidence * 100).toFixed(1)}%`
               : 'n/a';
           lines.push(`[agent:classify] AI-1 -> ${p.classified_fault} @ ${conf} confidence.`);
+          // The pipeline has just run AI-1, and publishes the confidence here.
+          // Reading it costs nothing — no second inference pass, and no timer.
+          if (typeof p.classifier_confidence === 'number') {
+            const pct = Number((p.classifier_confidence * 100).toFixed(1));
+            setConfusionVals(prev => ({ ...prev, truePos: pct, accuracy: pct }));
+          }
         }
         lines.push(
           p.success

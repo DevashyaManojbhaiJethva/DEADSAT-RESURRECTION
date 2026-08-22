@@ -1,22 +1,45 @@
 # DeadSat Resurrection — Python dependencies
 # Install with: pip install -r requirements.txt
+#
+# REPRODUCIBILITY (Phase 8.1)
+# ---------------------------
+# Every requirement carries an UPPER bound. Previously only langgraph and
+# langchain-core were pinned and everything else was floored with `>=` and no
+# ceiling, so `pip install -r requirements.txt` resolved differently depending
+# on the day it was run. A training run is only reproducible if the stack
+# under it is: numpy and torch have both changed RNG or default-dtype
+# behaviour across minor versions in ways that move model weights.
+#
+# Upper bounds are set at the next MAJOR (or the next minor for pre-1.0
+# packages), which blocks a breaking release without freezing out patches.
+#
+# For an exact, byte-identical environment use the lockfile instead:
+#
+#     pip install -r requirements.lock      # exact versions, reproducible
+#     pip install -r requirements.txt       # ranges, for development
+#
+# Regenerate the lock after ANY change to this file:
+#
+#     python -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements.txt
+#     pip freeze --exclude-editable > requirements.lock
 
 # ── API layer ─────────────────────────────────────────────────────────
-fastapi>=0.111.0
-uvicorn>=0.30.0
-pydantic>=2.7.0
+fastapi>=0.111.0,<1.0.0
+uvicorn>=0.30.0,<1.0.0
+pydantic>=2.7.0,<3.0.0
 websockets>=14,<16
-python-dotenv>=1.0.0
-httpx>=0.27.0
+python-dotenv>=1.0.0,<2.0.0
+httpx>=0.27.0,<1.0.0
 
 # ── AI-1: fault classifier (transformer encoder + isolation forest) ───
 # Required by models/satellite_fault_classifier_V2.py and train_classifier.py.
 # Without these the pipeline still runs, but only in --skip-classifier mode.
-torch>=2.0.0
-scikit-learn>=1.3.0
-numpy>=1.24.0
-pandas>=2.0.0
-tqdm>=4.65.0
+torch>=2.0.0,<3.0.0
+scikit-learn>=1.3.0,<2.0.0
+numpy>=1.24.0,<3.0.0
+pandas>=2.0.0,<3.0.0
+tqdm>=4.65.0,<5.0.0
 
 # ── AI-2: agentic recovery graph ──────────────────────────────────────
 langgraph==1.2.4
@@ -26,9 +49,9 @@ langchain-core==1.4.2
 # Required by backend/main.py, which imports crypto_routes at module level.
 # Without these `import backend.main` fails with ModuleNotFoundError before
 # the FastAPI app object is constructed — the backend tree cannot start.
-pynacl>=1.5.0          # Ed25519 — the classical half of the hybrid signature
-redis>=5.0.0           # nonce store (replay protection)
-slowapi>=0.1.9         # rate limiting on the crypto routes
+pynacl>=1.5.0,<2.0.0          # Ed25519 — the classical half of the hybrid signature
+redis>=5.0.0,<7.0.0           # nonce store (replay protection)
+slowapi>=0.1.9,<0.2.0         # rate limiting on the crypto routes
 #
 # liboqs-python (ML-DSA-65, the post-quantum half) is NOT pip-installable from
 # PyPI — it needs liboqs built from source first. See crypto/README.md
@@ -36,11 +59,11 @@ slowapi>=0.1.9         # rate limiting on the crypto routes
 # mock_oqs_nacl.py shim is a development fallback only and is NOT secure.
 
 # ── Orbital mechanics (ground contact windows) ────────────────────────
-sgp4>=2.23
+sgp4>=2.23,<3.0.0
 
 # ── Dev / test ────────────────────────────────────────────────────────
-pytest>=8.0.0
-matplotlib>=3.7.0
+pytest>=8.0.0,<9.0.0
+matplotlib>=3.7.0,<4.0.0
 
 # Optional: N2YO live TLE refresh — no package needed, just an API key
 #   export N2YO_API_KEY=...

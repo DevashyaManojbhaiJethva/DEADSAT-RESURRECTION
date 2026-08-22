@@ -22,6 +22,8 @@ import {
   api,
   subscribeEvents,
   subscribeTelemetry,
+  subscribeRF,
+  RFFrame,
 } from '../api';
 
 /** Map an emulator telemetry frame onto this dashboard's chart point. */
@@ -153,18 +155,6 @@ export default function SatelliteDashboard() {
         score = 97.8;
       }
 
-      setAnomalyFeed(feed => [
-        {
-          id: Date.now().toString() + '-inject',
-          timestamp: timeStr,
-          subsystem: sub,
-          anomalyScore: score,
-          status: 'fault',
-          actionTaken: 'Triggered safe-hold. Standing by for PQC secure recovery authorization key.'
-        },
-        ...feed.slice(0, 7)
-      ]);
-
       // Add corresponding Unix logs for Screen 2 Terminal Mocking
       const logTime = new Date().toISOString();
       setFastapiLogs(prev => [...prev, `[${logTime}] POST /api/fault/inject - Status: 200 OK (Fault: ${fault.toUpperCase()})`].slice(-25));
@@ -184,21 +174,6 @@ export default function SatelliteDashboard() {
       // WIRING: activeFault is no longer cleared locally — the emulator's
       // next telemetry frame decides whether the fault actually cleared.
       // Clearing it here made every recovery look successful regardless.
-      const timeStr = new Date().toLocaleTimeString();
-
-      // Clear faults and push NOMINAL restore logs
-      setAnomalyFeed(feed => [
-        {
-          id: Date.now().toString() + '-clear',
-          timestamp: timeStr,
-          subsystem: 'OBC',
-          anomalyScore: 4.2,
-          status: 'nominal',
-          actionTaken: 'Satellite recovered successfully! Normal telemetry stream resumed.'
-        },
-        ...feed.slice(0, 7)
-      ]);
-
       // These lines are written by the BROWSER, not received from Pi #1. They
       // previously asserted things that had not happened and could not be
       // observed from here: a "Crystals-Dilithium signature transmitted 200 OK"
@@ -229,11 +204,8 @@ export default function SatelliteDashboard() {
 
   // Live simulation states
   const [historyData, setHistoryData] = useState<TelemetryDataPoint[]>([]);
-  const [anomalyFeed, setAnomalyFeed] = useState<AnomalyAlert[]>([
-    { id: '1', timestamp: '14:02:10', subsystem: 'ADCS', anomalyScore: 12.4, status: 'nominal', actionTaken: 'Star tracker attitude lock continuous' },
-    { id: '2', timestamp: '14:05:33', subsystem: 'Power', anomalyScore: 28.5, status: 'warning', actionTaken: 'Solar panels rotated 1.5° for beta angle optimal' },
-    { id: '3', timestamp: '14:08:45', subsystem: 'OBC', anomalyScore: 8.1, status: 'nominal', actionTaken: 'RAM ECC scrubbing single-bit correction processed' },
-  ]);
+  const [historyAccess, setHistoryAccess] = useState<string | null>(null);
+  const [anomalyFeed, setAnomalyFeed] = useState<AnomalyAlert[]>([]);
 
   // Systems Status state
   const [statuses, setStatuses] = useState({
@@ -259,7 +231,7 @@ export default function SatelliteDashboard() {
   const mountRef = useRef<HTMLDivElement>(null);
   const orbitalAngleRef = useRef<number>(0);
   const earthRotationRef = useRef<number>(0);
-  const satelliteMeshRef = useRef<THREE.Group | null>(null);
+  const satelliteMeshRef = useRef<THREE.Object3D | null>(null);
   const linkLineMeshRef = useRef<THREE.Line | null>(null);
   const ahmedabadMeshRef = useRef<THREE.Mesh | null>(null);
   const domeMeshRef = useRef<THREE.Mesh | null>(null);
@@ -290,30 +262,33 @@ export default function SatelliteDashboard() {
   const waterfallCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const spectrumPhaseRef = useRef<number>(0);
 
-  // WIRING: live RTL-SDR power spectrum from Pi #2, proxied via Pi #1.
+  // WIRING: live RTL-SDR power spectrum from Pi #2 via WebSocket streaming.
   const rfBinsRef = useRef<number[]>([]);
   const [rfOnline, setRfOnline] = useState<boolean>(false);
   const [rfMeta, setRfMeta] = useState<any>(null);
+  const [rfFrame, setRfFrame] = useState<RFFrame | null>(null);
 
   useEffect(() => {
-    let alive = true;
-    const poll = async () => {
-      try {
-        const res: any = await api.rfSpectrum();
-        if (!alive) return;
-        const bins: number[] = res?.data?.bins ?? res?.data?.power_dbm ?? [];
+    // Use WebSocket for live RF streaming instead of polling
+    const handle = subscribeRF(
+      (frame: RFFrame) => {
+        // Update RF data from frame
+        const bins: number[] = frame.spectrum ?? [];
         rfBinsRef.current = Array.isArray(bins) ? bins : [];
-        setRfOnline(Boolean(res?.online) && rfBinsRef.current.length > 0);
-        setRfMeta(res?.data ?? null);
-      } catch {
-        if (!alive) return;
-        rfBinsRef.current = [];
-        setRfOnline(false);
+        setRfOnline(frame.rf_health === 'online');
+        setRfMeta(frame);
+        setRfFrame(frame);
+      },
+      (connected: boolean) => {
+        setRfOnline(connected);
+        if (!connected) {
+          rfBinsRef.current = [];
+          setRfMeta(null);
+          setRfFrame(null);
+        }
       }
-    };
-    poll();
-    const t = setInterval(poll, 1000);
-    return () => { alive = false; clearInterval(t); };
+    );
+    return () => handle.close();
   }, []);
 
   // 1. WIRING: TLE + orbital elements from the backend catalog.
@@ -354,23 +329,56 @@ export default function SatelliteDashboard() {
   };
 
   // Refetch whenever the emulator reports a different satellite.
+  //
+  // WIRING: this used to call load() once and then wait 300 s. Before the
+  // emulator's first tick, get_latest_frame() returns {}, so `norad_id` is
+  // undefined, the TLE fetch is skipped, and the next attempt is five minutes
+  // away. The UI reliably loads faster than the backend boots, so the orbit
+  // panel sat blank for five minutes on essentially every cold start.
+  //
+  // Now: retry every second for up to ~30 s until norad_id resolves, then hand
+  // over to the unchanged 5-minute refresh.
   useEffect(() => {
     let alive = true;
-    const load = async () => {
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let elapsed = 0;
+    const RETRY_MS = 1000;
+    const RETRY_LIMIT_MS = 30000;
+
+    const load = async (): Promise<boolean> => {
       try {
         const f: any = await api.telemetry();
         if (alive && f?.norad_id) {
           setOrbitalNumber(f.frame_id ?? 0);
           await fetchTLE(f.norad_id);
+          return true;
         }
       } catch {
         if (alive) setTleLastFetched('backend unreachable');
         setTleLoading(false);
       }
+      return false;
     };
-    load();
+
+    // Poll until the emulator has produced its first frame.
+    const loadUntilReady = async () => {
+      if (!alive) return;
+      if (await load()) return;              // got it — the 5-min timer takes over
+      if (elapsed >= RETRY_LIMIT_MS) {
+        if (alive) setTleLastFetched('waiting for emulator — no frames yet');
+        return;
+      }
+      elapsed += RETRY_MS;
+      retryTimer = setTimeout(loadUntilReady, RETRY_MS);
+    };
+
+    loadUntilReady();
     const tleTimer = setInterval(load, 300000); // refresh every 5 min
-    return () => { alive = false; clearInterval(tleTimer); };
+    return () => {
+      alive = false;
+      if (retryTimer) clearTimeout(retryTimer);
+      clearInterval(tleTimer);
+    };
   }, []);
 
   // 2. Initialize history data for charts
@@ -383,6 +391,8 @@ export default function SatelliteDashboard() {
       .then((res: any) => {
         if (!alive) return;
         const frames: TelemetryFrame[] = res?.frames ?? res ?? [];
+        const restricted = frames.find((frame: any) => frame.access && frame.access !== 'FULL');
+        setHistoryAccess(restricted?.access ?? (frames.length ? 'FULL' : null));
         if (Array.isArray(frames) && frames.length) {
           setHistoryData(frames.map(frameToPoint));
         }
@@ -497,40 +507,22 @@ export default function SatelliteDashboard() {
         );
       },
       (up) => setWsConnected(up),
+      // Backfill: the socket's first message carries up to 60 past frames so
+      // the chart is populated immediately instead of drawing itself one point
+      // per second. Same frameToPoint mapper as the live path, so the seeded
+      // points and the streamed ones are identical in shape.
+      (frames: TelemetryFrame[]) => {
+        if (!frames.length) return;
+        setHistoryData(frames.slice(-60).map(frameToPoint));
+        setFastapiLogs(prev =>
+          [...prev, `[${new Date().toISOString()}] WS history — ${frames.length} frames backfilled`].slice(-25),
+        );
+      },
     );
     return () => sock.close();
   }, []);
 
   // WIRING: anomaly feed built from real fault transitions, not a 2% random roll.
-  const lastFaultRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (activeFault === lastFaultRef.current) return;
-    const prevFault = lastFaultRef.current;
-    lastFaultRef.current = activeFault;
-
-    const ts = new Date().toLocaleTimeString();
-    if (activeFault) {
-      const subsystem: AnomalyAlert['subsystem'] =
-        activeFault === 'SEU' ? 'ADCS'
-        : activeFault === 'software_bug' ? 'OBC'
-        : activeFault === 'firmware_corruption' ? 'Power'
-        : 'Comms';
-      setAnomalyFeed(feed => [
-        { id: `${Date.now()}`, timestamp: ts, subsystem, anomalyScore: 95,
-          status: 'fault', actionTaken: `Emulator reports ${activeFault} — AI-2 recovery available` },
-        ...feed.slice(0, 7),
-      ]);
-      setWatchdogLogs(prev => [...prev, `[${new Date().toISOString()}] HEARTBEAT: WARNING — ${activeFault} active.`].slice(-25));
-    } else if (prevFault) {
-      setAnomalyFeed(feed => [
-        { id: `${Date.now()}`, timestamp: ts, subsystem: 'Watchdog', anomalyScore: 5,
-          status: 'nominal', actionTaken: `${prevFault} cleared — satellite returned to nominal` },
-        ...feed.slice(0, 7),
-      ]);
-      setWatchdogLogs(prev => [...prev, `[${new Date().toISOString()}] HEARTBEAT: OK — fault cleared.`].slice(-25));
-    }
-  }, [activeFault]);
-
   // WIRING: agent/pipeline events drive the recovery + crypto terminals.
   useEffect(() => {
     const sock = subscribeEvents((e) => {
@@ -1390,7 +1382,10 @@ export default function SatelliteDashboard() {
           <div className="border-t border-white/10 pt-4 mt-2">
             <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#D4D4D4]/60 mb-4 flex items-center gap-1.5">
               <Activity className="w-3.5 h-3.5 text-signal-green" />
-              LIVE TELEMETRY CRITICAL LANES (6 METRICS OVER TIME - UPDATE FREQ: 1s)
+               LIVE TELEMETRY CRITICAL LANES (6 METRICS OVER TIME - UPDATE FREQ: 1s)
+               {historyAccess && historyAccess !== 'FULL' && (
+                 <span className="ml-2 text-[9px] text-amber-300">HISTORY ACCESS: {historyAccess} — some fields are restricted</span>
+               )}
             </h3>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -1593,19 +1588,21 @@ export default function SatelliteDashboard() {
                 <div className="flex justify-between items-start border-b border-white/5 pb-1.5">
                   <div>
                     <h4 className="font-mono text-[9px] text-[#D4D4D4]/50 uppercase tracking-widest font-black">RF SIGNAL STRENGTH</h4>
-                    <span className="text-[22px] font-mono font-black text-white">{(historyData[historyData.length - 1]?.signalStrength || -110)} dBm</span>
+                    <span className="text-[22px] font-mono font-black text-white">
+                      {rfFrame ? `${rfFrame.signal_dbm.toFixed(1)} dBm` : `${(historyData[historyData.length - 1]?.signalStrength || -110)} dBm`}
+                    </span>
                   </div>
                   
-                  {/* Status indicator: solid small dot with status text */}
-                  {isInContact ? (
+                  {/* Status indicator: RF node status */}
+                  {rfOnline ? (
                     <div className="flex items-center gap-1.5 font-mono text-[8.5px] font-bold tracking-wider">
                       <span className="w-2 h-2 rounded-full bg-[#00FF8C] animate-pulse"></span>
-                      <span className="text-[#00FF8C]">LOCK OK</span>
+                      <span className="text-[#00FF8C]">RF NODE ONLINE</span>
                     </div>
                   ) : (
                     <div className="flex items-center gap-1.5 font-mono text-[8.5px] font-bold tracking-wider">
-                      <span className="w-2 h-2 rounded-full bg-[#00E5FF] animate-pulse"></span>
-                      <span className="text-[#00E5FF]">STANDBY</span>
+                      <span className="w-2 h-2 rounded-full bg-red-500"></span>
+                      <span className="text-red-400">RF NODE OFFLINE</span>
                     </div>
                   )}
                 </div>
@@ -1795,7 +1792,9 @@ export default function SatelliteDashboard() {
             <div className="bg-[#1A1A1A] border border-white/10 p-4 rounded-sm flex flex-col justify-between h-[210px] shadow-lg relative min-w-0 font-mono">
               <div className="text-[9.5px] font-black text-white border-b border-white/10 pb-2 uppercase tracking-wider flex justify-between items-center">
                 <span>SDR FREQUENCY SPECTRUM STREAM</span>
-                <span className={isInContact ? 'text-signal-green' : 'text-red-400'}>{isInContact ? 'SIGNAL CENTER CH: CARRIER SYNCED' : 'LOW POWER NOISE FLOOR'}</span>
+                <span className={rfOnline ? 'text-signal-green' : 'text-red-400'}>
+                  {rfOnline ? 'RF NODE ONLINE - LIVE DATA' : 'RF NODE OFFLINE - NO SIGNAL'}
+                </span>
               </div>
               
               {/* Dynamic SVG Waveform representation */}

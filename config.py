@@ -42,6 +42,7 @@ Nothing here has side effects — importing this module is always safe.
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 # Load .env if python-dotenv is available (it is in requirements.txt).
@@ -114,6 +115,24 @@ RF_BASE: str = _env("DEADSAT_RF_BASE", f"http://{PUBLIC_HOST}:{RF_PORT}")
 #: powered-down Pi #2 degrades the dashboard instead of hanging it.
 RF_TIMEOUT_S: float = float(_env("DEADSAT_RF_TIMEOUT_S", "3.0"))
 
+#: RF acquisition parameters for Pi #2 service
+RF_CENTER_FREQUENCY_HZ: float = float(_env("RF_CENTER_FREQUENCY_HZ", "137900000.0"))
+RF_SAMPLE_RATE: int = _env_int("RF_SAMPLE_RATE", "2400000")
+RF_GAIN: float = float(_env("RF_GAIN", "49.6"))
+RF_STREAM_INTERVAL_S: float = float(_env("RF_STREAM_INTERVAL_S", "1.0"))
+RF_MOCK_MODE: bool = _env_bool("RF_MOCK_MODE", False)
+
+#: RF_LOCATION_* are explicit aliases; legacy GROUND_* remains supported.
+RF_LOCATION_LAT: float = float(_env("RF_LOCATION_LAT", _env("GROUND_LAT", "23.03")))
+RF_LOCATION_LON: float = float(_env("RF_LOCATION_LON", _env("GROUND_LON", "72.58")))
+GROUND_LAT: float = RF_LOCATION_LAT
+GROUND_LON: float = RF_LOCATION_LON
+GROUND_ELEV_M: float = float(_env("GROUND_ELEV_M", "53"))
+
+#: Default satellite for RF tracking
+DEFAULT_NORAD_ID: int = _env_int("DEFAULT_NORAD_ID", "59051")  # Meteor-M2-4
+RF_TARGET_NORAD_ID: int = _env_int("RF_TARGET_NORAD_ID", str(DEFAULT_NORAD_ID))
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Frontend / CORS
@@ -173,6 +192,28 @@ def cors_is_unreachable_from_lan() -> bool:
 #: (fine for a closed bench network, not for anything routable).
 API_KEY: str = _env("DEADSAT_API_KEY", "")
 
+# JWTs are issued by the deployment's existing identity provider.  The API
+# verifies HS256 signatures only; it never seeds or manages production users.
+JWT_SECRET: str = _env("DEADSAT_JWT_SECRET", "")
+JWT_ISSUER: str = _env("DEADSAT_JWT_ISSUER", "")
+JWT_AUDIENCE: str = _env("DEADSAT_JWT_AUDIENCE", "")
+JWT_TTL_S: int = _env_int("DEADSAT_JWT_TTL_S", 900)
+JWT_WS_TTL_S: int = _env_int("DEADSAT_JWT_WS_TTL_S", 60)
+
+def _auth_users() -> dict[str, dict[str, object]]:
+    """Load deployment-managed users; malformed configuration disables login."""
+    raw = _env("DEADSAT_AUTH_USERS_JSON", "{}")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {str(name): user for name, user in value.items() if isinstance(user, dict)}
+
+AUTH_USERS: dict[str, dict[str, object]] = _auth_users()
+PRIVACY_AUDIT_DB: str = _env("DEADSAT_PRIVACY_AUDIT_DB", str(Path(__file__).resolve().parent / "data" / "privacy_audit.sqlite3"))
+
 #: Require a successful /crypto/verify before the emulator applies a
 #: recovery procedure. This is the security gate the project is built
 #: around; leave it on unless the crypto service genuinely is unavailable.
@@ -211,7 +252,21 @@ def summary() -> dict:
             "bind": f"{API_HOST}:{API_PORT}",
             "public_base": API_BASE,
         },
-        "rf": {"base": RF_BASE, "timeout_s": RF_TIMEOUT_S},
+        "rf": {
+            "base": RF_BASE, 
+            "timeout_s": RF_TIMEOUT_S,
+            "center_frequency_hz": RF_CENTER_FREQUENCY_HZ,
+            "sample_rate": RF_SAMPLE_RATE,
+            "gain": RF_GAIN,
+            "stream_interval_s": RF_STREAM_INTERVAL_S,
+            "mock_mode": RF_MOCK_MODE,
+            "ground_station": {
+                "lat": GROUND_LAT,
+                "lon": GROUND_LON,
+                "elev_m": GROUND_ELEV_M
+            },
+            "target_norad_id": RF_TARGET_NORAD_ID
+        },
         "crypto": {"sign": CRYPTO_SIGN_URL, "verify": CRYPTO_VERIFY_URL},
         "cors_origins": CORS_ORIGINS,
         "security": {

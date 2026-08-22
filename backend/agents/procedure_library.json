@@ -1,10 +1,10 @@
 {
   "version": "1.0",
-  "description": "DeadSat Resurrection \u2014 Recovery Procedure Library. Maps fault types to ordered command sequences. Each procedure is tried in priority order; fallback to next if satellite does not return to nominal.",
+  "description": "DeadSat Resurrection — Recovery Procedure Library. Maps fault types to ordered command sequences. Each procedure is tried in priority order; fallback to next if satellite does not return to nominal.",
   "procedures": {
     "SEU": {
       "fault_type": "SEU",
-      "description": "Single Event Upset \u2014 cosmic ray bit flip in OBC/ADCS register",
+      "description": "Single Event Upset — cosmic ray bit flip in OBC/ADCS register",
       "detection_indicators": [
         "adcs_rate_deg_s > 0.1",
         "adcs_pointing_err_deg > 1.0",
@@ -61,7 +61,7 @@
         {
           "priority": 2,
           "procedure_name": "OBC_SOFT_REBOOT_v1",
-          "description": "Fallback \u2014 soft reboot OBC to clear all register corruption",
+          "description": "Fallback — soft reboot OBC to clear all register corruption",
           "commands": [
             {
               "seq": 1,
@@ -103,7 +103,7 @@
     },
     "software_bug": {
       "fault_type": "software_bug",
-      "description": "OBC software crash loop \u2014 memory pointer corruption, CPU runaway",
+      "description": "OBC software crash loop — memory pointer corruption, CPU runaway",
       "detection_indicators": [
         "obc_cpu_pct > 85",
         "obc_memory_pct > 80",
@@ -115,7 +115,7 @@
         {
           "priority": 1,
           "procedure_name": "OBC_SOFT_REBOOT_v1",
-          "description": "Software process restart \u2014 fastest recovery path",
+          "description": "Software process restart — fastest recovery path",
           "commands": [
             {
               "seq": 1,
@@ -166,7 +166,7 @@
         {
           "priority": 2,
           "procedure_name": "OBC_HARD_RESET_v1",
-          "description": "Fallback \u2014 power cycle OBC board entirely",
+          "description": "Fallback — power cycle OBC board entirely",
           "commands": [
             {
               "seq": 1,
@@ -209,7 +209,7 @@
     },
     "firmware_corruption": {
       "fault_type": "firmware_corruption",
-      "description": "Firmware image corrupted \u2014 checksum mismatch, all subsystems degrading",
+      "description": "Firmware image corrupted — checksum mismatch, all subsystems degrading",
       "detection_indicators": [
         "obc_status == fault",
         "comms_uplink == false",
@@ -275,7 +275,7 @@
         {
           "priority": 2,
           "procedure_name": "SAFE_MODE_HOLD",
-          "description": "Emergency fallback \u2014 hold in minimal safe mode, await next ground contact",
+          "description": "Emergency fallback — hold in minimal safe mode, await next ground contact",
           "commands": [
             {
               "seq": 1,
@@ -302,7 +302,7 @@
     },
     "command_injection": {
       "fault_type": "command_injection",
-      "description": "Unsigned rogue command injected to comms channel \u2014 attacker draining power, compromising systems",
+      "description": "Unsigned rogue command injected to comms channel — attacker draining power, compromising systems",
       "detection_indicators": [
         "comms_status == fault",
         "fault_detail.signed == false",
@@ -358,7 +358,7 @@
         {
           "priority": 2,
           "procedure_name": "COMMS_HARD_RESET_v1",
-          "description": "Fallback \u2014 power cycle comms subsystem entirely",
+          "description": "Fallback — power cycle comms subsystem entirely",
           "commands": [
             {
               "seq": 1,
@@ -394,6 +394,168 @@
           },
           "timeout_s": 60,
           "min_confidence": 0.75
+        }
+      ]
+    },
+    "battery_failure": {
+      "fault_type": "battery_failure",
+      "description": "Battery cell failure — capacity collapse and bus undervoltage. Power-subsystem hardware fault; not visible to AI-1, which classifies from orbital elements only.",
+      "detection_indicators": [
+        "battery_pct falling monotonically",
+        "bus_voltage_v < 27.0",
+        "power_charging == false",
+        "power_status == fault"
+      ],
+      "recovery_priority": [
+        {
+          "priority": 1,
+          "procedure_name": "BATTERY_CELL_ISOLATE_v1",
+          "description": "Isolate the failed cell, re-balance the remaining string, restore charging",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "PWR_LOAD_SHED",
+              "args": {
+                "level": "non_essential"
+              },
+              "description": "Shed non-essential loads before switching"
+            },
+            {
+              "seq": 2,
+              "cmd": "PWR_ISOLATE_CELL",
+              "args": {
+                "cell": "CELL_3"
+              },
+              "description": "Open the failed cell's isolation FET"
+            },
+            {
+              "seq": 3,
+              "cmd": "PWR_REBALANCE_STRING",
+              "args": {},
+              "description": "Re-balance the remaining cells"
+            },
+            {
+              "seq": 4,
+              "cmd": "PWR_ENABLE_CHARGE",
+              "args": {},
+              "description": "Re-enable charging on the reduced string"
+            }
+          ],
+          "success_criteria": {
+            "bus_voltage_v": ">= 27.5",
+            "power_charging": true,
+            "power_status": "nominal"
+          },
+          "timeout_s": 30,
+          "min_confidence": 0.6
+        },
+        {
+          "priority": 2,
+          "procedure_name": "POWER_SAFE_MODE_v1",
+          "description": "Shed all non-essential loads and hold on the beacon until the next contact",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "PWR_LOAD_SHED",
+              "args": {
+                "level": "all"
+              },
+              "description": "Shed every non-essential load"
+            },
+            {
+              "seq": 2,
+              "cmd": "COMMS_BEACON_ONLY",
+              "args": {},
+              "description": "Beacon only, downlink off"
+            }
+          ],
+          "success_criteria": {
+            "beacon_active": true,
+            "bus_voltage_v": ">= 26.0"
+          },
+          "timeout_s": 30,
+          "min_confidence": 0.5
+        }
+      ]
+    },
+    "adcs_failure": {
+      "fault_type": "adcs_failure",
+      "description": "Reaction-wheel actuator failure — mechanical loss of attitude control. Distinct from an SEU: no OBC error count, and a memory scrub cannot fix a stalled wheel.",
+      "detection_indicators": [
+        "adcs_wheel_rpm == 0",
+        "adcs_rate_deg_s > 0.05",
+        "adcs_pointing_err_deg rising",
+        "obc_error_count_delta == 0"
+      ],
+      "recovery_priority": [
+        {
+          "priority": 1,
+          "procedure_name": "ADCS_WHEEL_RESTART_v1",
+          "description": "Attempt a controlled restart of the stalled reaction wheel",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "ADCS_SAFE_HOLD",
+              "args": {},
+              "description": "Enter ADCS safe hold before touching the actuator"
+            },
+            {
+              "seq": 2,
+              "cmd": "ADCS_WHEEL_POWER_CYCLE",
+              "args": {
+                "wheel": "RW_Y"
+              },
+              "description": "Power cycle the wheel driver"
+            },
+            {
+              "seq": 3,
+              "cmd": "ADCS_WHEEL_SPINUP",
+              "args": {
+                "rpm": 4800
+              },
+              "description": "Spin the wheel back to nominal"
+            },
+            {
+              "seq": 4,
+              "cmd": "ADCS_RESET_ESTIMATOR",
+              "args": {},
+              "description": "Reset the attitude estimator"
+            }
+          ],
+          "success_criteria": {
+            "adcs_wheel_rpm": "> 4000",
+            "adcs_rate_deg_s": "< 0.01",
+            "adcs_status": "nominal"
+          },
+          "timeout_s": 30,
+          "min_confidence": 0.7
+        },
+        {
+          "priority": 2,
+          "procedure_name": "ADCS_MAGNETORQUER_FALLBACK_v1",
+          "description": "Wheel unrecoverable — hold attitude on magnetorquers only (coarse pointing)",
+          "commands": [
+            {
+              "seq": 1,
+              "cmd": "ADCS_DISABLE_WHEEL",
+              "args": {
+                "wheel": "RW_Y"
+              },
+              "description": "Disable the dead wheel"
+            },
+            {
+              "seq": 2,
+              "cmd": "ADCS_ENABLE_MAGNETORQUER",
+              "args": {},
+              "description": "Switch to magnetorquer-only control"
+            }
+          ],
+          "success_criteria": {
+            "adcs_rate_deg_s": "< 0.05",
+            "adcs_pointing_err_deg": "< 1.0"
+          },
+          "timeout_s": 30,
+          "min_confidence": 0.5
         }
       ]
     }
